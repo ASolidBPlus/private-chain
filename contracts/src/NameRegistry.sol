@@ -197,6 +197,27 @@ contract NameRegistry is AccessControl {
         // No zero-address guard: both entry points refuse a zero target before
         // reaching this, and an unreachable branch would report as uncovered
         // while proving nothing.
+        // AND THE CONSEQUENCE OF "only when empty", stated because it is not
+        // visible from this line (reviewer's observation; no behaviour change).
+        //
+        // `reverse[target]` is CLEARED in two places - `transfer`, when a name
+        // changes hands, and `setTarget`, when it moves away - and it is only
+        // ever written here, on a registration, and only into an empty slot. So
+        // an address whose primary name was cleared has NO primary name until
+        // something registers a new one for it, and the NEXT registerFor for
+        // that address takes the slot whatever name it carries.
+        //
+        // chain-svc never exercises that: it registers the canonical id first
+        // and an alias only afterwards, so the canonical always wins the empty
+        // slot. The consequence is for anything else holding the registrar
+        // role - register a vanity alias for an address whose primary was
+        // cleared and the alias BECOMES that address's primary name, and
+        // `reverseOf` answers with it.
+        //
+        // Left as it is deliberately: the alternative is re-writing `reverse`
+        // on retarget, which is the promotion this design exists to prevent
+        // (see setTarget). The rule that keeps it safe is the ORDER a registrar
+        // registers in, and that rule lives in the caller.
         if (mayWriteReverse && reverse[target] == bytes32(0)) {
             reverse[target] = key;
         }

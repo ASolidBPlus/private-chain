@@ -144,6 +144,44 @@ const DOCUMENTS: Array<{ what: string; body: unknown; expect: Expected }> = [
     },
   },
 
+  // ── A KEY THE DOCUMENT HAS NEVER HAD IS A WRONG SHAPE ────────────────
+  //
+  // v0.8.0 closed mistyped VALUES and left KEYS free-form, which was the one
+  // fail-open direction it did not shut: a misspelled bound is read as ABSENT,
+  // and absent means NO bound. The typo widens, silently, and the file still
+  // looks right to whoever wrote it.
+  {
+    what: 'an entry with only an unknown key',
+    body: { caps: { play: { max_per_tx_typo: '5' } } },
+    expect: { unreadable: true },
+  },
+  {
+    // THE WORSE ONE, because it looks like it works: the known half binds, the
+    // typo'd half does not, and the wallet carries one bound where its author
+    // wrote two.
+    what: 'an entry with a known key and an unknown one',
+    body: { caps: { play: { max_per_tx: '5', max_per_stage_typo: '50' } } },
+    expect: { unreadable: true },
+  },
+  { what: 'an unknown top-level key', body: { capz: { play: { max_per_tx: '5' } } }, expect: { unreadable: true } },
+
+  // ── AND THE SHAPE THE INSTALLED BASE IS ACTUALLY IN ──────────────────
+  //
+  // THE ROW THAT WOULD HAVE CAUGHT THE FIRST DRAFT OF THE RULE. Every file
+  // v0.7.0's spawn wrote looks exactly like this: `agentId` because
+  // `writePolicyFile` stamps it, and `frozen` because the service-side freeze
+  // lived in the document. A known set without those two marks the entire
+  // installed base unreadable - which is the write-path defect (the service
+  // refusing a document it wrote itself) arriving through a second door.
+  //
+  // `agentId` is KNOWN and `frozen` is TOLERATED AND DISCARDED: it is read past
+  // and never carried forward, so the wallet gets its caps and nothing else.
+  {
+    what: 'a file in the exact shape the v0.7.0 spawn wrote (reviewer probe 5)',
+    body: { agentId: 'orch:legacy', caps: { play: { max_per_tx: '100' } }, allow: ['*'], deny: [], frozen: false },
+    expect: { caps: { play: { max_per_tx: '100' } }, allow: ['*'], deny: [] },
+  },
+
   // ── Unreadable: the SHAPE is wrong, not a value ───────────────────────
   { what: 'not an object', body: ['not', 'a', 'policy'], expect: { unreadable: true } },
   {

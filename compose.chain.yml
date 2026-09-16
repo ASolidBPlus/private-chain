@@ -20,6 +20,19 @@ services:
       # standalone, export it first. Accepted: an empty phrase is a
       # shared treasury key, which is worse than a startup error.
       ANVIL_MNEMONIC: "${ANVIL_MNEMONIC:?ANVIL_MNEMONIC must be set in the hub .env - it derives the treasury key}"
+    # FINDING 27. Neither flag is a mitigation for a threat this stack has; both
+    # remove a capability nothing here uses, so the cost of being wrong later is
+    # paid now instead.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # READ-ONLY ROOT: anvil writes its state file and nothing else, and that
+    # file is on a volume. A tmpfs for /tmp because a read-only root with no
+    # writable temp is a container that fails in ways nobody can read.
+    read_only: true
+    tmpfs:
+      - /tmp
     volumes:
       - chain-state:/state
     ports:
@@ -46,8 +59,47 @@ services:
         condition: service_healthy
     environment:
       ANVIL_MNEMONIC: "${ANVIL_MNEMONIC:?ANVIL_MNEMONIC must be set in the hub .env - it derives the treasury key}"
+      # Forge's three write paths, off the read-only source tree.
+      #
+      # THREE, not the two the finding named, and the third was found by running
+      # it rather than by reading: `forge script --broadcast` saves a
+      # transaction sequence to `broadcast/<script>/<chainid>/run-latest.json`,
+      # and with the source mounted :ro the deploy died AFTER simulating
+      # successfully -
+      #
+      #   ERROR forge_script::sequence: could not save deployment sequence
+      #   err=failed to create file "/contracts/broadcast/.../run-latest.json":
+      #   Read-only file system (os error 30)
+      #
+      # - which `docker compose config` cannot see and a unit test cannot reach.
+      # Naming only OUT leaves the cache behind, naming only those two leaves
+      # the broadcast log behind, and each one is written on every run.
+      FOUNDRY_OUT: /tmp/forge-out
+      FOUNDRY_CACHE_PATH: /tmp/forge-cache
+      FOUNDRY_BROADCAST: /tmp/forge-broadcast
+    # FINDING 27. Neither flag is a mitigation for a threat this stack has; both
+    # remove a capability nothing here uses, so the cost of being wrong later is
+    # paid now instead.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # NOT read_only: `forge` writes its build output and cache, which findings
+    # 26 points at /tmp - and a tmpfs for those is sized wrong the first time
+    # somebody adds a contract. The one directory it must write outside /tmp is
+    # `deployments/`, which is the bind mount below and the reason this service
+    # exists.
+    tmpfs:
+      - /tmp
     volumes:
-      - ./contracts:/contracts
+      # FINDING 26: THE SOURCE IS READ-ONLY, and forge's scratch moves off it.
+      # `forge script` writes `out/` and `cache/` beside the sources by default,
+      # so a container build left root-owned artefacts in the developer's tree -
+      # which is a nuisance until the day the tree is a checkout somebody else
+      # verifies, and then it is a container writing into the thing under test.
+      # `deployments/` stays WRITABLE here: this is the service that promotes
+      # local.json.pending, and it is the only one.
+      - ./contracts:/contracts:ro
       - ./deployments:/deployments
     # Account 0 of the mnemonic is the deployer and the treasury (spec S2), so
     # the key is derived in the script rather than being a second secret to keep
@@ -83,11 +135,31 @@ services:
       POLICY_DIR: /policies
       STORE_PATH: /store/chain-svc.sqlite
       HUB_CORE_URL: "${HUB_CORE_URL:-}"
+    # FINDING 27. Neither flag is a mitigation for a threat this stack has; both
+    # remove a capability nothing here uses, so the cost of being wrong later is
+    # paid now instead.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # READ-ONLY ROOT: every write chain-svc makes is to one of the three
+    # volumes below - the keystore, the policy directory and the sqlite store -
+    # which is the same "three volumes, one lifetime" that the ledger control
+    # already depends on. If that ever stops being true, this line is what says
+    # so, loudly, on the first boot after the change.
+    read_only: true
+    tmpfs:
+      - /tmp
     volumes:
       - keystore:/keystore
       - policies:/policies
       - svc-store:/store
-      - ./deployments:/deployments
+      # FINDING 26: READ-ONLY. chain-svc READS the deployment manifest at boot
+      # and never writes it - the deploy one-shot above owns that file, and it
+      # is the one service that needs the directory writable. A service that
+      # cannot write a file it has no reason to write cannot corrupt it when
+      # something goes wrong inside it.
+      - ./deployments:/deployments:ro
     ports:
       - "127.0.0.1:7000:7000"
 
@@ -106,6 +178,31 @@ services:
       # must be the published loopback port and never chain:8545, which resolves
       # only inside the compose network.
       ERIGON_URL: http://127.0.0.1:8545
+    # FINDING 27, and this is the service where "drop ALL" is not free.
+    #
+    # nginx starts as root, chowns its cache directories and drops to the
+    # `nginx` user - so with every capability gone it dies before it serves:
+    #
+    #   [emerg] chown("/var/cache/nginx/client_temp", 101) failed
+    #           (1: Operation not permitted)
+    #
+    # Measured by starting it, not by reading the Dockerfile. So: drop
+    # everything and add back the four it demonstrably uses - CHOWN for the
+    # cache directories, SETUID and SETGID to become `nginx`, NET_BIND_SERVICE
+    # for port 80. That is still far less than the default set, and every entry
+    # names a thing this image does at startup rather than a thing it might.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - NET_BIND_SERVICE
+    # NOT read_only: the same startup writes its cache and pid paths under /var,
+    # and a tmpfs for each would be guessing at sizes. Stated rather than left
+    # blank, so the asymmetry with the other three reads as a decision.
     ports:
       - "127.0.0.1:5100:80"
 

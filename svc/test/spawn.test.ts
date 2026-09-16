@@ -725,7 +725,7 @@ describe('the release rule', () => {
       }),
     ).rejects.toThrow();
 
-    expect(store.intentTxHash('i2')).toBe('0xfeed');
+    expect(store.intentTxHash('orch:a', 'i2')).toBe('0xfeed');
     store.close();
   });
 
@@ -757,7 +757,7 @@ describe('the release rule', () => {
     it('returns the ORIGINAL hash when the first send completed', async () => {
       const store = new Store(':memory:');
       seed(store);
-      store.completeIntent('replay', '0xorig');
+      store.completeIntent('orch:a', 'replay', '0xorig');
       expect(await replayTreasury(store).signTransfer(asWallet('orch:a'), send)).toEqual({
         txHash: '0xorig',
         intentId: 'replay',

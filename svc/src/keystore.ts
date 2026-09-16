@@ -54,6 +54,58 @@ export class Keystore {
     return join(this.dir, keyFileName(agentId));
   }
 
+  /// THE LEDGER WATERMARK: the highest reservation count this keystore has seen
+  /// the store report (finding 22).
+  ///
+  /// It lives HERE, beside the keys, because the store cannot witness its own
+  /// rollback: restore the store from a backup and any counter inside it is
+  /// restored too, and the two agree about a past that is no longer true. The
+  /// three volumes share one lifetime by design - the control above already
+  /// leans on that - so a copy on a DIFFERENT volume is a fact the restored
+  /// file cannot carry with it.
+  ///
+  /// A plain integer in a dotfile rather than a second database: it is one
+  /// number, it is written once per boot, and anything more would be a second
+  /// thing that can be half-written.
+  private watermarkPath(): string {
+    return join(this.dir, '.ledger-watermark');
+  }
+
+  /// The recorded high-water mark, or NULL when this keystore has never
+  /// recorded one.
+  ///
+  /// ABSENT IS NOT ZERO, and the distinction carries a whole failure mode. A
+  /// keystore that has never recorded a mark is a fresh one, and cannot accuse
+  /// a store of anything - the first boot after this ships establishes it. A
+  /// keystore whose mark has GONE while the store's counter is non-zero is a
+  /// keystore volume lost from under a live ledger, which is the wipe control's
+  /// own case seen from the other side. Collapsing the two to 0 would make the
+  /// second indistinguishable from the first and silently permit it.
+  ///
+  /// Unreadable content reads as absent rather than throwing: this file is the
+  /// ACCUSER, not the evidence, and a corrupt byte in it must not be able to
+  /// lock an operator out of a healthy game. The keys beside it are what the
+  /// control is really about, and `agentCount` is the read that must propagate.
+  async ledgerWatermark(): Promise<number | null> {
+    try {
+      const raw = await readFile(this.watermarkPath(), 'utf8');
+      const n = Number.parseInt(raw.trim(), 10);
+      return Number.isSafeInteger(n) && n >= 0 ? n : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /// Record a new high-water mark. NEVER LOWERS IT: the only way this number
+  /// goes down is somebody deleting the file, which is the same act as deleting
+  /// the keys beside it.
+  async recordLedgerWatermark(reservations: number): Promise<void> {
+    const current = await this.ledgerWatermark();
+    if (current !== null && reservations <= current) return;
+    await mkdir(this.dir, { recursive: true });
+    await writeFile(this.watermarkPath(), String(reservations), 'utf8');
+  }
+
   /// How many agents this keystore holds keys for. Read at startup by the
   /// ledger-lifetime control: keys here beside an EMPTY intents ledger means
   /// the store was deleted on its own, because a fresh install has neither.
@@ -153,11 +205,41 @@ export class Keystore {
       throw new HttpError('internal_error', `unsupported key file version ${file.version}`);
     }
 
+    // THE CONSTANTS, NOT THE FILE'S OWN PARAMETERS (the reviewer's KDF
+    // observation).
+    //
+    // `N`, `r` and `p` set the COST of the derivation, and taking them from the
+    // key file lets the file choose how hard it is to brute-force itself. An
+    // attacker who can write into the keystore volume - which is the threat the
+    // encryption exists for, since a reader of the volume is exactly who must
+    // not get the keys - can rewrite `N` to 2, re-encrypt under that, and hand
+    // back a file this service opens without complaint. The work factor stops
+    // being a property of the service and becomes a property of the artefact
+    // under suspicion.
+    //
+    // REFUSED RATHER THAN SILENTLY RE-DERIVED WITH THE CONSTANTS, and the
+    // difference matters: a file written under different parameters will not
+    // decrypt under these, so quietly using ours would report "could not be
+    // decrypted" for what is really a parameter change - and the operator would
+    // go looking for a corrupt file or a wrong passphrase. It names which
+    // parameter differs instead.
+    if (file.kdf.N !== KDF.N || file.kdf.r !== KDF.r || file.kdf.p !== KDF.p) {
+      const differs = [
+        file.kdf.N !== KDF.N ? `N=${file.kdf.N} (expected ${KDF.N})` : null,
+        file.kdf.r !== KDF.r ? `r=${file.kdf.r} (expected ${KDF.r})` : null,
+        file.kdf.p !== KDF.p ? `p=${file.kdf.p} (expected ${KDF.p})` : null,
+      ].filter((x): x is string => x !== null);
+      throw new HttpError(
+        'internal_error',
+        `key file records KDF parameters this build does not use: ${differs.join(', ')}`,
+      );
+    }
+
     const salt = Buffer.from(file.kdf.salt, 'base64');
     const key = await scrypt(this.secret, salt, KDF.keyLength, {
-      N: file.kdf.N,
-      r: file.kdf.r,
-      p: file.kdf.p,
+      N: KDF.N,
+      r: KDF.r,
+      p: KDF.p,
       maxmem: KDF.maxmem,
     });
 

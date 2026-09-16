@@ -19,7 +19,8 @@ import { join } from 'node:path';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { decodeFunctionData, type Abi } from 'viem';
-import { Treasury, serialiseResult, type Signer } from '../src/treasury.ts';
+import { TokenAbi } from '../src/abi.ts';
+import { Treasury, serialiseResult, PLATFORM_INTENT_AGENT, type Signer } from '../src/treasury.ts';
 import { Store } from '../src/store.ts';
 import { HttpError } from '../src/errors.ts';
 import { fixedCallPolicy, type CallEntry } from '../src/calls.ts';
@@ -726,7 +727,7 @@ describe('per-entry counting', () => {
       ),
     ).not.toBe('no-error');
     expect(store.callCount('orch:a', store.currentStage(), 'converter', 'convert')).toBe(0);
-    expect(store.intentCall('i-1')).toBeNull();
+    expect(store.intentCall('orch:a', 'i-1')).toBeNull();
     store.close();
   });
 });
@@ -800,7 +801,7 @@ describe('a revert the contract rejects BEFORE it is mined', () => {
     // wire and the whole reservation comes back - the intent, the stage hold
     // and the per-entry count.
     expect(store.callCount('orch:a', store.currentStage(), 'converter', 'convert')).toBe(0);
-    expect(store.intentCall('i-1')).toBeNull();
+    expect(store.intentCall('orch:a', 'i-1')).toBeNull();
     expect(t.signed).toHaveLength(0);
   });
 
@@ -831,7 +832,7 @@ describe('a mined revert', () => {
     // IT WAS MINED, so the slot stays spent. A persona can lose stage budget to
     // a paused pair, and `read` is free for anyone unsure.
     expect(store.callCount('orch:a', store.currentStage(), 'converter', 'convert')).toBe(1);
-    expect(store.intentTxHash('i-1')).toBe('0xhash');
+    expect(store.intentTxHash('orch:a', 'i-1')).toBe('0xhash');
   });
 
   it('still emits the event, marked reverted', async () => {
@@ -1011,7 +1012,7 @@ describe('admin-call', () => {
       intentId: '',
     });
     expect(out.intentId).toMatch(/^chain-svc:/);
-    expect(store.intentIdSource(out.intentId)).toBe('server');
+    expect(store.intentIdSource(PLATFORM_INTENT_AGENT, out.intentId)).toBe('server');
   });
 
   it('emits hub.call', async () => {
@@ -1259,7 +1260,7 @@ describe('a transfer in a second token', () => {
     expect((decoded.args as unknown[])[1]).toBe(3_000000n);
 
     // THE BOOKKEEPING COORDINATE, which is the KEY and never the symbol.
-    expect(store.intentToken('g-1')).toBe('gold');
+    expect(store.intentToken('orch:a', 'g-1')).toBe('gold');
     expect(store.spentThisStage('orch:a', store.currentStage(), 'gold')).toBe(3_000000n);
     // AND THE DEFAULT TOKEN'S BUDGET IS UNTOUCHED, which is the whole point of
     // per-token caps: spending gold must not consume a persona's play budget.
@@ -1365,6 +1366,42 @@ describe('fund and set-balance, per token', () => {
     expect(written).toEqual([GOLD]);
   });
 
+  // FINDING 1, PART TWO: fund RESERVES now, so it is idempotent like every other
+  // intent path. It emitted a topic and wrote no row, so `recordEmission` hit
+  // its "not an intent this store reserved" branch on every facilitator top-up
+  // and the transfer was invisible to the emission and anomaly path - and two
+  // POST /fund with one intentId both moved money, with the double emission
+  // invisible for the same reason.
+  it('a repeated fund under one intent id moves money ONCE', async () => {
+    const { t, store } = await harness();
+    const first = await t.fund({ to: 'bob.play', amount: '2', intentId: 'dedupe-1' });
+    written.length = 0;
+    const second = await t.fund({ to: 'bob.play', amount: '2', intentId: 'dedupe-1' });
+
+    // THE CONTRACT WAS NOT TOUCHED the second time. Asserting only the txHash
+    // would pass against a second real transfer that happened to be reported
+    // with the first one's hash.
+    expect(written).toEqual([]);
+    expect(second.txHash).toBe(first.txHash);
+    // ...and there is ONE row, under the RECIPIENT, which is who the money is
+    // for and the wallet a reconciliation would be about.
+    expect(store.intentTxHash('orch:bob', 'dedupe-1')).toBe(first.txHash);
+  });
+
+  it('a fund is visible to the emission path, which is what makes absence mean something', async () => {
+    const { t, store } = await harness();
+    await t.fund({ to: 'bob.play', amount: '2', intentId: 'emit-1' });
+
+    // EVERY EMISSION HAS A ROW - the first half of the invariant printed on
+    // sweepToTreasury. Before this, the topic went on chain and no row existed,
+    // so this read null and every fund was another party's traffic as far as
+    // the detector was concerned.
+    const topic = store.intentTopicOf('orch:bob', 'emit-1');
+    expect(topic).not.toBeNull();
+    expect(store.recordEmission({ topic: topic!, txHash: '0xfund', from: '0xtreasury', isExpectedEmitter: true })).toBeNull();
+    expect(store.intentRecord('orch:bob', 'emit-1')?.emissions).toBe(1);
+  });
+
   it('defaults to the default token when none is named', async () => {
     const { t } = await harness();
     await t.fund({ to: 'bob.play', amount: '2', intentId: 'f-2' });
@@ -1401,6 +1438,38 @@ describe('fund and set-balance, per token', () => {
     // The SIGNED transaction is the assertion here, because a sweep is signed
     // with the wallet's own key rather than written by the treasury.
     expect(t.signed[0]!.to).toBe(GOLD);
+  });
+
+  // FINDING 1, THE OTHER DIRECTION OF THE INVARIANT PRINTED ON sweepToTreasury:
+  // "`fund` and this and `/sign-transfer` all emit an IntentTransfer and absence
+  // of one keeps meaning something".
+  //
+  // The fund half is asserted above (every emission has a row). This is the
+  // half that was false from the other side: the sweep RECORDED an intent and
+  // emitted a plain `transfer`, under a comment saying transferWithIntent
+  // "arrives with the contract PR, which sequences after this one" - and that
+  // PR landed at v0.7.0 while the line stayed. So a sweep's absence of an
+  // IntentTransfer meant nothing, and the sweep's negative branch reads absence
+  // as "it did not land".
+  it('the sweep emits an IntentTransfer carrying the topic on its own row', async () => {
+    const { t, store } = await harness();
+    await t.setBalance('orch:a', { amount: '0.00001', token: 'gold', intentId: 'sw-2' }).catch(() => undefined);
+
+    // DECODED FROM THE CALLDATA, because that is what goes on chain. The
+    // harness records `{to, data}`, and `to` alone cannot tell `transfer` from
+    // `transferWithIntent` - both reach the right contract with the right
+    // amount, and only one of them tells the tail which intent authorised it.
+    const call = decodeFunctionData({ abi: TokenAbi, data: t.signed[0]!.data });
+    expect(call.functionName).toBe('transferWithIntent');
+
+    // ...and the bytes32 it carries is the one ON THE ROW, not a re-derivation.
+    // With rows written either side of v8 in one store, a re-derivation puts a
+    // topic on chain that the row does not carry, `recordEmission` matches
+    // nothing, and the intent sits unresolved for ever with a transfer that
+    // really happened.
+    const stored = store.intentTopicOf('orch:a', 'sw-2');
+    expect(stored).not.toBeNull();
+    expect((call.args as readonly unknown[])[2]).toBe(stored);
   });
 
   it('sets the balance of the NAMED token, measuring and moving the same one', async () => {
@@ -1454,5 +1523,89 @@ describe('the read size bound', () => {
     expect(
       await codeOf(() => t.read(asWallet('orch:a'), { contract: 'converter', function: 'quote', args: [] })),
     ).toBe('bad_args');
+  });
+});
+
+// THE over_stage_cap DETAIL NAMES THE LIMIT THAT ACTUALLY FIRED.
+//
+// Two different limits produce one outcome: the WALLET's per-stage spend bound
+// (its policy) and the ENTRY's per-stage call count (calls.json). They are
+// configured in different files by different people, so an operator told the
+// wrong one goes and edits the wrong file.
+//
+// The message used to key on `entry.maxPerStage !== undefined && !money`, so on
+// an entry carrying BOTH - which `convert` does, and which is the ordinary shape
+// for anything that moves money a bounded number of times - the count branch was
+// skipped and the reply reported the wallet's max_per_stage AMOUNT, a bound that
+// had not tripped.
+describe('over_stage_cap says which limit tripped', () => {
+  const capped = (agentId: string, maxPerStage: string) =>
+    writeFileSync(
+      join(POLICY_DIR, `${encodeURIComponent(agentId)}.json`),
+      JSON.stringify({ agentId, caps: { play: { max_per_tx: '1000', max_per_stage: maxPerStage } }, allow: ['*'], deny: [] }),
+    );
+
+  it('names the COUNT and the entry when the call count trips', async () => {
+    const store = new Store(':memory:');
+    store.markSpawned('orch:counted', '0x000000000000000000000000000000000000cc01', 'agent');
+    // A stage amount high enough that only the COUNT can fire. Stated rather
+    // than left implicit: with both able to trip, this row would be asserting
+    // the tie-break instead of the branch it names.
+    capped('orch:counted', '1000000');
+    const { t } = await harness(undefined, { store });
+
+    // CONVERT carries maxPerStage: 2 AND an amount rule, which is the shape the
+    // finding is about.
+    await t.call(asWallet('orch:counted'), convertBody({ intentId: 'c-1' }));
+    await t.call(asWallet('orch:counted'), convertBody({ intentId: 'c-2' }));
+
+    let err: HttpError | undefined;
+    try { await t.call(asWallet('orch:counted'), convertBody({ intentId: 'c-3' })); } catch (e) { err = e as HttpError; }
+    expect(err?.code).toBe('over_stage_cap');
+    expect(err?.detail).toBe('convert on converter may be called 2 times per stage');
+    // AND NOT the other limit's words, because the defect was not "says
+    // nothing" - it was "says the other one, confidently".
+    expect(err?.detail).not.toMatch(/max_per_stage/);
+    store.close();
+  });
+
+  it('names the AMOUNT when the wallet stage bound trips', async () => {
+    const store = new Store(':memory:');
+    store.markSpawned('orch:broke', '0x000000000000000000000000000000000000cc02', 'agent');
+    // Below one convert, so the FIRST call trips the amount and the count
+    // (limit 2) cannot have fired.
+    capped('orch:broke', '1');
+    const { t } = await harness(undefined, { store });
+
+    let err: HttpError | undefined;
+    try { await t.call(asWallet('orch:broke'), convertBody({ intentId: 'b-1' })); } catch (e) { err = e as HttpError; }
+    expect(err?.code).toBe('over_stage_cap');
+    expect(err?.detail).toMatch(/^max_per_stage is 1 for this stage$/);
+    store.close();
+  });
+
+  // WHEN BOTH WOULD TRIP, THE AMOUNT WINS - because `reserve` checks the stage
+  // spend before the entry count. Asserted rather than left to chance: a
+  // tie-break nobody wrote down is one that changes silently when the two
+  // checks are reordered, and the two limits are refused in the same breath.
+  //
+  // (The spec's parenthetical said the count is checked first. Measured here:
+  // it is not. `reserve` tests the stage amount at the top of the transaction
+  // and the entry count below it.)
+  it('reports the AMOUNT when both would trip, because that is the one checked first', async () => {
+    const store = new Store(':memory:');
+    store.markSpawned('orch:both', '0x000000000000000000000000000000000000cc03', 'agent');
+    capped('orch:both', '1');
+    const { t } = await harness(undefined, { store });
+
+    // Exhaust the count too, so both are genuinely over - each of these refuses
+    // on the amount, which is the point: the count never gets to increment.
+    for (const id of ['x-1', 'x-2', 'x-3']) {
+      await t.call(asWallet('orch:both'), convertBody({ intentId: id })).catch(() => undefined);
+    }
+    let err: HttpError | undefined;
+    try { await t.call(asWallet('orch:both'), convertBody({ intentId: 'x-4' })); } catch (e) { err = e as HttpError; }
+    expect(err?.detail).toMatch(/^max_per_stage is 1 for this stage$/);
+    store.close();
   });
 });

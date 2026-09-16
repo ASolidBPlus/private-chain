@@ -38,7 +38,16 @@ export interface MemoRecord {
 
 export type Reservation =
   | { outcome: 'reserved'; txHash: null }
-  | { outcome: 'over_stage_cap'; txHash: null }
+  /// WHICH LIMIT TRIPPED, because two different ones produce this outcome and
+  /// the caller's message has to name the one that fired.
+  ///
+  ///   'stage_amount'  the WALLET's per-stage spend bound, from its policy
+  ///   'entry_calls'   the ENTRY's per-stage call count, from calls.json
+  ///
+  /// They are not interchangeable to an operator: one is money the wallet may
+  /// move, the other is how many times a function may be invoked, and they are
+  /// configured in different files by different people.
+  | { outcome: 'over_stage_cap'; txHash: null; limit: 'stage_amount' | 'entry_calls' }
   | { outcome: 'duplicate'; txHash: string | null };
 
 import { migrate } from './migrate.ts';
@@ -59,6 +68,30 @@ export class Store {
   constructor(path: string) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.db = new Database(path, { create: true });
+    // FINDING 13: WAIT FOR A BUSY WRITER RATHER THAN THROWING AT IT.
+    //
+    // WAL keeps readers out of a writer's way; it does not make two WRITERS
+    // wait. Without a busy timeout, sqlite answers SQLITE_BUSY IMMEDIATELY -
+    // so two processes opening this store at once (the service and a CLI, or a
+    // restart overlapping its predecessor) had the second one throw during
+    // MIGRATION, which is the one moment the store is half-shaped.
+    //
+    // Five seconds because the thing being waited for is a migration, not a
+    // request: a numbered step rewrites a table and then stamps a version, and
+    // a caller that gives up at 100ms gives up in the middle of that.
+    //
+    // FIRST, AND THE ORDER IS THE FIX RATHER THAN A TIDY-UP. It was set after
+    // the line below, and `PRAGMA journal_mode = WAL` TAKES AN EXCLUSIVE LOCK
+    // to rewrite the header - so the second process died on the pragma that
+    // configures the store, one statement before the timeout that would have
+    // let it wait:
+    //
+    //   SQLiteError: database is locked   at PRAGMA journal_mode = WAL
+    //
+    // Found because the ten-trial test flaked rather than failed - roughly one
+    // run in three - which is the shape a race has when the window is a single
+    // statement wide.
+    this.db.exec('PRAGMA busy_timeout = 5000');
     // WAL so a reader (/history) is never blocked by the events writer.
     this.db.exec('PRAGMA journal_mode = WAL');
     // Ordering is migrate()'s to enforce, not this constructor's - see migrate.ts.
@@ -107,13 +140,24 @@ export class Store {
       -- stage rather than being zeroed on transition: a late-arriving transfer
       -- from the previous stage cannot then overdraw the new one.
       -- An intent is RESERVED before the money moves and is never deleted.
-      -- intent_id is the PRIMARY KEY, so a second attempt under the same id
-      -- cannot insert: that is the idempotency guarantee, and it lives on the
-      -- side that cannot forget rather than in the persona's JSON ledger, which
-      -- is only written after a successful response and so is empty in exactly
-      -- the case it exists for.
+      -- A second attempt under the same id BY THE SAME WALLET cannot insert:
+      -- that is the idempotency guarantee, and it lives on the side that cannot
+      -- forget rather than in the persona's JSON ledger, which is only written
+      -- after a successful response and so is empty in exactly the case it
+      -- exists for.
+      -- THE KEY IS (agent_id, intent_id), NOT intent_id (v8, finding 1). An
+      -- intent id is a string the CALLER chooses, so a globally unique key made
+      -- one wallet's choice of the string collide with another's: bob reserving
+      -- "payment-1" after alice got back alice's txHash and alice's money moved
+      -- nothing. Measured on a live stack before the fix - bob's send answered
+      -- 200 with alice's hash and bob's own canonical, and bob's balance did
+      -- not change.
+      --
+      -- Another wallet's id is simply a different row. No new refusal word and
+      -- no oracle: nothing tells bob that alice used the string, because
+      -- nothing should.
       CREATE TABLE IF NOT EXISTS intents (
-        intent_id  TEXT PRIMARY KEY,
+        intent_id  TEXT NOT NULL,
         agent_id   TEXT NOT NULL,
         stage      TEXT NOT NULL,
         amount     TEXT NOT NULL,
@@ -171,7 +215,8 @@ export class Store {
         call_contract  TEXT,
         call_function  TEXT,
         call_args_hash TEXT,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (agent_id, intent_id)
       );
       -- Only ever holds the SECOND and later emissions for one intent, so it is
       -- small by construction rather than by pruning.
@@ -257,6 +302,28 @@ export class Store {
         next_attempt_at INTEGER NOT NULL DEFAULT 0,
         created_at      INTEGER NOT NULL
       );
+      -- ONE ROW, AND A NUMBER THAT ONLY EVER GOES UP (finding 22).
+      --
+      -- reservations counts every intent this store has ever RESERVED. Not how
+      -- many exist: release deletes rows, and a count of what is present goes
+      -- DOWN in the ordinary course of business. This is the fact a restored
+      -- backup cannot fake, and the reason it is a counter rather than
+      -- MAX(rowid) - sqlite reuses the top rowid when the highest row is
+      -- deleted, so the obvious measure falls when a wallet merely releases its
+      -- most recent reservation.
+      --
+      -- (No backticks in this block: it is inside a JS template literal, and a
+      -- backtick in a SQL comment ends the string. Cost me the same five
+      -- minutes in the v8 migration.)
+      --
+      -- The CHECK pins it to one row: a second row would make "the counter" a
+      -- question with two answers, and the comparison at boot reads it as a
+      -- scalar.
+      CREATE TABLE IF NOT EXISTS ledger_facts (
+        id           INTEGER PRIMARY KEY CHECK (id = 1),
+        reservations INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT OR IGNORE INTO ledger_facts (id, reservations) VALUES (1, 0);
     `), () => this.db.exec(`
       CREATE INDEX IF NOT EXISTS intents_topic ON intents (topic);
     `));
@@ -281,6 +348,23 @@ export class Store {
   /// boot found anything. `spawns` is written only by a spawn request.
   walletsRecorded(): number {
     return (this.db.query(`SELECT COUNT(*) AS n FROM spawns`).get() as { n: number }).n;
+  }
+
+  /// EVERY INTENT THIS STORE HAS EVER RESERVED, monotonically (finding 22).
+  ///
+  /// Never how many exist. `release` deletes rows and this number does not
+  /// move, which is what makes it comparable against a copy kept OUTSIDE the
+  /// store: if the file goes back in time and the copy does not, the two
+  /// disagree, and nothing an operator does in the normal course of a game can
+  /// produce that disagreement.
+  reservationsEverMade(): number {
+    const row = this.db.query(`SELECT reservations FROM ledger_facts WHERE id = 1`).get() as
+      | { reservations: number }
+      | null;
+    // A store older than this table reads as zero rather than throwing: the
+    // guard starts protecting from the first boot that has it, which is the
+    // honest answer for a history it never recorded.
+    return row?.reservations ?? 0;
   }
 
   close(): void {
@@ -613,16 +697,28 @@ export class Store {
     // one decision: "may this send happen". Two transactions would admit a
     // window where the intent is taken and the budget is not, or the reverse.
     const attempt = this.db.transaction((): Reservation => {
+      // BOTH COORDINATES (v8, finding 1). Keyed on the id alone, bob's reserve
+      // of a string alice had used found ALICE's row and answered `duplicate`
+      // with her txHash - bob's send reported success, moved nothing, and
+      // handed him a hash of somebody else's transfer.
       const existing = this.db
-        .query(`SELECT tx_hash FROM intents WHERE intent_id = ?`)
-        .get(intentId) as { tx_hash: string | null } | null;
+        .query(`SELECT tx_hash FROM intents WHERE agent_id = ? AND intent_id = ?`)
+        .get(agentId, intentId) as { tx_hash: string | null } | null;
       if (existing) return { outcome: 'duplicate', txHash: existing.tx_hash };
 
       // Re-read INSIDE the transaction: a value read before it began is the
       // same stale figure the check-then-act acted on.
+      //
+      // THIS IS WHERE THE TIE-BREAK IS DECIDED. Two limits produce
+      // `over_stage_cap` - this stage AMOUNT and the per-entry call COUNT below
+      // - and when both would trip, the caller reports whichever is tested
+      // first. That is this one. `Treasury.call` names the limit from
+      // `reservation.limit`, so reordering these two checks silently changes
+      // what an operator is told to go and edit; a test asserts the amount wins
+      // and says it is asserting the order rather than a preference.
       const current = this.spentThisStage(agentId, stage, token);
       if (bound !== null && current + amount > bound) {
-        return { outcome: 'over_stage_cap', txHash: null };
+        return { outcome: 'over_stage_cap', txHash: null, limit: 'stage_amount' };
       }
 
       // The per-entry limit, read inside the same transaction and for the same
@@ -635,7 +731,7 @@ export class Store {
         ? this.callCount(agentId, stage, call!.contract, call!.function)
         : 0;
       if (counted && usedThisStage + 1 > call!.maxPerStage!) {
-        return { outcome: 'over_stage_cap', txHash: null };
+        return { outcome: 'over_stage_cap', txHash: null, limit: 'entry_calls' };
       }
 
       this.db
@@ -663,6 +759,15 @@ export class Store {
           token,
           Date.now(),
         );
+      // FINDING 22. THE COUNTER GOES UP HERE AND NOWHERE ELSE, inside the same
+      // transaction as the reservation - so it cannot record a reservation that
+      // did not happen, and a reservation cannot happen without it.
+      //
+      // `release` does NOT decrement it. That is the whole point: a count of
+      // live rows falls in the ordinary course of business, and a measure that
+      // falls legitimately cannot distinguish "this store went backwards in
+      // time" from "somebody released an intent".
+      this.db.query(`UPDATE ledger_facts SET reservations = reservations + 1 WHERE id = 1`).run();
       if (counted) {
         this.db
           .query(
@@ -709,8 +814,10 @@ export class Store {
   /// Records the result of a send against the intent that authorised it, so a
   /// retry can be answered with the original transaction rather than a second
   /// one.
-  completeIntent(intentId: string, txHash: string): void {
-    this.db.query(`UPDATE intents SET tx_hash = ? WHERE intent_id = ?`).run(txHash, intentId);
+  completeIntent(agentId: string, intentId: string, txHash: string): void {
+    this.db
+      .query(`UPDATE intents SET tx_hash = ? WHERE agent_id = ? AND intent_id = ?`)
+      .run(txHash, agentId, intentId);
   }
 
   /// THERE IS DELIBERATELY NO TIMED SWEEP OF STALE HOLDS, and this is the
@@ -743,7 +850,15 @@ export class Store {
   /// UTC; the contract change rides the post-#14 PR.
 
   /// The whole reservation row, for reconciliation (spec S4 "Intents").
-  intentRecord(intentId: string): {
+  /// One wallet's intent, by BOTH coordinates.
+  ///
+  /// The ownership question stops being a comparison and becomes the lookup:
+  /// asking under your own id can only ever return your own row. Before v8 the
+  /// row came back by id alone and `getIntent` compared its `agent_id` to the
+  /// principal - which, once two wallets can use one string, answers
+  /// `unknown_intent` for a caller's OWN intent whenever somebody else's row is
+  /// the one the id happens to find.
+  intentRecord(agentId: string, intentId: string): {
     agentId: string;
     txHash: string | null;
     emissions: number;
@@ -751,8 +866,11 @@ export class Store {
     firstFrom: string | null;
   } | null {
     const row = this.db
-      .query(`SELECT agent_id, tx_hash, emissions, first_tx, first_from FROM intents WHERE intent_id = ?`)
-      .get(intentId) as
+      .query(
+        `SELECT agent_id, tx_hash, emissions, first_tx, first_from
+         FROM intents WHERE agent_id = ? AND intent_id = ?`,
+      )
+      .get(agentId, intentId) as
       | { agent_id: string; tx_hash: string | null; emissions: number; first_tx: string | null; first_from: string | null }
       | null;
     return row
@@ -913,8 +1031,10 @@ export class Store {
   /// rather than on stage. Test-only: every row a test creates is seconds old,
   /// so a wall-clock TTL is the one variant of "emission rows are immortal"
   /// that no ordinary fixture can reach.
-  backdateIntentForTest(intentId: string, createdAt: number): void {
-    this.db.query(`UPDATE intents SET created_at = ? WHERE intent_id = ?`).run(createdAt, intentId);
+  backdateIntentForTest(agentId: string, intentId: string, createdAt: number): void {
+    this.db
+      .query(`UPDATE intents SET created_at = ? WHERE agent_id = ? AND intent_id = ?`)
+      .run(createdAt, agentId, intentId);
   }
 
   /// Intents this store reserved that have no recorded transaction, with the
@@ -1030,8 +1150,76 @@ export class Store {
   /// from a chain-svc uuid being quoted, which are different stories about how
   /// somebody learned it. A test that can see the column is what keeps the two
   /// from silently becoming one.
-  intentIdSource(intentId: string): string | null {
-    const row = this.db.query(`SELECT id_source FROM intents WHERE intent_id = ?`).get(intentId) as
+  /// The same row for a PLATFORM caller, which has no wallet coordinate to ask
+  /// with - the route takes an id and nothing else.
+  ///
+  /// EXACTLY ONE OR NOTHING. If two wallets have used the string, this answers
+  /// null and the operator gets the same `unknown_intent` as for an id nobody
+  /// used. That is deliberate: returning either row would be picking one
+  /// wallet's intent to represent both, and refusing differently would make the
+  /// reply an existence oracle for the collision. Absence and ambiguity are one
+  /// answer here for the same reason absence and not-yours already were.
+  ///
+  /// The consequence, stated rather than buried: an operator asking about an id
+  /// two wallets used is told there is no such intent. Nothing calls this path
+  /// today - wallet-mcp is the only caller of GET /intents/:id and it is always
+  /// wallet scope - so this is a shape decision, not a behaviour change anybody
+  /// is relying on. If the operator needs to name the wallet, that is a route
+  /// parameter and a separate decision.
+  intentRecordUnambiguous(intentId: string): {
+    agentId: string;
+    txHash: string | null;
+    emissions: number;
+    firstTx: string | null;
+    firstFrom: string | null;
+  } | null {
+    const rows = this.db
+      .query(
+        `SELECT agent_id, tx_hash, emissions, first_tx, first_from
+         FROM intents WHERE intent_id = ? LIMIT 2`,
+      )
+      .all(intentId) as Array<{
+      agent_id: string;
+      tx_hash: string | null;
+      emissions: number;
+      first_tx: string | null;
+      first_from: string | null;
+    }>;
+    if (rows.length !== 1) return null;
+    const row = rows[0]!;
+    return {
+      agentId: row.agent_id,
+      txHash: row.tx_hash,
+      emissions: row.emissions,
+      firstTx: row.first_tx,
+      firstFrom: row.first_from,
+    };
+  }
+
+  /// THE TOPIC THIS INTENT WAS RESERVED WITH, read back rather than re-derived.
+  ///
+  /// Every broadcast takes its bytes32 from here (v8, finding 1). The
+  /// derivation changed at v8 - it is the hash of both coordinates now - so a
+  /// store can hold rows written either side of it, and a broadcast that
+  /// re-derived would put a topic on chain that the row does not carry. The
+  /// emission would then match nothing, `recordEmission` would return null as
+  /// for an intent this store never reserved, and the intent would sit on the
+  /// reconciliation path for ever with a transfer that really happened.
+  ///
+  /// NULL MEANS NO ROW OR NO TOPIC, and the caller decides: an intent reserved
+  /// before topics existed has none, and that is a different thing from a
+  /// reservation that is not there at all.
+  intentTopicOf(agentId: string, intentId: string): string | null {
+    const row = this.db
+      .query(`SELECT topic FROM intents WHERE agent_id = ? AND intent_id = ?`)
+      .get(agentId, intentId) as { topic: string | null } | null;
+    return row?.topic ?? null;
+  }
+
+  intentIdSource(agentId: string, intentId: string): string | null {
+    const row = this.db
+      .query(`SELECT id_source FROM intents WHERE agent_id = ? AND intent_id = ?`)
+      .get(agentId, intentId) as
       | { id_source: string | null }
       | null;
     return row?.id_source ?? null;
@@ -1043,15 +1231,19 @@ export class Store {
   /// intent's OWN token, not the deployment's default - which is what makes a
   /// second token's IntentTransfer an ordinary emission and a cross-token one
   /// an anomaly.
-  intentToken(intentId: string): string | null {
-    const row = this.db.query(`SELECT token FROM intents WHERE intent_id = ?`).get(intentId) as
+  intentToken(agentId: string, intentId: string): string | null {
+    const row = this.db
+      .query(`SELECT token FROM intents WHERE agent_id = ? AND intent_id = ?`)
+      .get(agentId, intentId) as
       | { token: string | null }
       | null;
     return row?.token ?? null;
   }
 
-  intentTxHash(intentId: string): string | null {
-    const row = this.db.query(`SELECT tx_hash FROM intents WHERE intent_id = ?`).get(intentId) as
+  intentTxHash(agentId: string, intentId: string): string | null {
+    const row = this.db
+      .query(`SELECT tx_hash FROM intents WHERE agent_id = ? AND intent_id = ?`)
+      .get(agentId, intentId) as
       | { tx_hash: string | null }
       | null;
     return row?.tx_hash ?? null;
@@ -1089,14 +1281,14 @@ export class Store {
   /// caller whose stage moves mid-request (`currentStage()` can change once
   /// hub-core is configured), and for the scan-gated sweep, which by
   /// construction RECONSTRUCTS these coordinates instead of remembering them.
-  release(intentId: string): void {
+  release(agentId: string, intentId: string): void {
     const undo = this.db.transaction((): void => {
       const row = this.db
         .query(
           `SELECT agent_id, stage, held_wei, token, call_contract, call_function
-           FROM intents WHERE intent_id = ? AND tx_hash IS NULL`,
+           FROM intents WHERE agent_id = ? AND intent_id = ? AND tx_hash IS NULL`,
         )
-        .get(intentId) as {
+        .get(agentId, intentId) as {
         agent_id: string;
         stage: string;
         held_wei: string;
@@ -1106,23 +1298,52 @@ export class Store {
       } | null;
       if (!row) return;
 
+      // FINDING 12: A HELD INTENT WITH NO TOKEN IS NOT RELEASABLE, and the
+      // check has to run BEFORE the delete.
+      //
+      // The refund below already declined to give back a hold whose currency
+      // the row does not name - correctly, since releasing it against a guess
+      // would credit budget in a currency it was never taken in. But the DELETE
+      // ran first, so the intent id was freed while its hold stayed consumed:
+      // the wallet lost the budget permanently AND the id became reusable,
+      // which is the worse half. The reservation stays whole instead.
+      //
+      // Reachable only for a row written before v7 whose backfill did not reach
+      // it - which the migration refuses to produce - so this is a guard on a
+      // state the code says cannot exist, kept because the cost of being wrong
+      // about that is a silent permanent debit. Logged by ID so an operator who
+      // meets it has something to act on.
+      const heldWei = BigInt(row.held_wei);
+      if (heldWei > 0n && row.token === null) {
+        console.warn(
+          `[chain-svc] intent ${intentId} of ${agentId} holds ${row.held_wei} wei in a currency ` +
+            `its row does not name, so it cannot be released; the reservation is left standing. ` +
+            `This row predates the per-token rekey and needs an operator.`,
+        );
+        return;
+      }
+
       // The `tx_hash IS NULL` here is REDUNDANT with the SELECT above, which
       // already returned for a completed intent - deliberately kept, because it
       // is the statement that would do the damage if the guard above ever moved
       // or changed shape. A mutation that removes it survives, and that is
       // correct rather than a coverage gap: it describes a change the code
       // cannot express while the early return stands.
-      this.db.query(`DELETE FROM intents WHERE intent_id = ? AND tx_hash IS NULL`).run(intentId);
+      this.db
+        .query(`DELETE FROM intents WHERE agent_id = ? AND intent_id = ? AND tx_hash IS NULL`)
+        .run(agentId, intentId);
 
-      const held = BigInt(row.held_wei);
+      const held = heldWei;
       // THE TOKEN COMES FROM THE ROW, like every other coordinate `release`
       // uses. A caller supplying it could give back a hold against a currency
       // it was never taken in - which would leave the real hold standing and
       // credit budget in another.
       //
-      // Null only on a row written before v7 whose backfill did not reach it,
-      // which the migration refuses to produce; the hold is then left alone
-      // rather than released against a guess.
+      // Null with a hold cannot reach here any more - the guard above returns
+      // before the delete - so this pair is now "a zero hold, or a token to
+      // release it in". Kept as a pair rather than narrowed to `held > 0n`,
+      // because it is the statement that would do the damage if that guard ever
+      // moved, exactly as the redundant `tx_hash IS NULL` below it is.
       if (held > 0n && row.token !== null) {
         this.releaseStageSpend(row.agent_id, row.stage, row.token, held);
       }
@@ -1162,10 +1383,16 @@ export class Store {
   /// same call. A repeat under the same id with different arguments is a
   /// different call wearing a used id, and returning the first call's hash
   /// would tell the caller their second call had succeeded.
-  intentCall(intentId: string): { contract: string; function: string; argsHash: string } | null {
+  intentCall(
+    agentId: string,
+    intentId: string,
+  ): { contract: string; function: string; argsHash: string } | null {
     const row = this.db
-      .query(`SELECT call_contract, call_function, call_args_hash FROM intents WHERE intent_id = ?`)
-      .get(intentId) as
+      .query(
+        `SELECT call_contract, call_function, call_args_hash
+         FROM intents WHERE agent_id = ? AND intent_id = ?`,
+      )
+      .get(agentId, intentId) as
       | { call_contract: string | null; call_function: string | null; call_args_hash: string | null }
       | null;
     if (!row || row.call_contract === null || row.call_function === null) return null;
@@ -1271,17 +1498,48 @@ export class Store {
   // --- outbox ------------------------------------------------------------
 
   /// @returns how many events were dropped to stay under the cap (0 normally).
+  /// FINDING 28. ONE TRANSACTION, and `chain.anomaly` rows are never evicted.
+  ///
+  /// Two faults in three statements. The insert, the count and the delete ran
+  /// separately, so two concurrent enqueues both counted a buffer that was
+  /// already over, both computed the same excess, and the second deleted rows
+  /// the first had already removed - evicting twice the overflow and taking
+  /// live events with it.
+  ///
+  /// And the eviction took the OLDEST row whatever it was. `chain.anomaly` is
+  /// the one event kind that means something went wrong - a double emission
+  /// under an intent this store reserved - and it is also, by construction, the
+  /// kind most likely to be sitting in a buffer that is overflowing, because
+  /// whatever produced the flood produced it too. The detector's whole output
+  /// was the first thing discarded.
+  ///
+  /// Anomalies are not exempt from the CAP, only from being chosen: if the
+  /// buffer is nothing but anomalies the delete removes none and the buffer
+  /// grows, which is the right failure - an operator with ten thousand
+  /// anomalies queued has a problem that silence would not fix.
   enqueueEvent(kind: string, payload: unknown): number {
-    this.db
-      .query(`INSERT INTO outbox (kind, payload, created_at) VALUES (?, ?, ?)`)
-      .run(kind, JSON.stringify(payload), Date.now());
+    return this.db.transaction((): number => {
+      this.db
+        .query(`INSERT INTO outbox (kind, payload, created_at) VALUES (?, ?, ?)`)
+        .run(kind, JSON.stringify(payload), Date.now());
 
-    const count = (this.db.query(`SELECT COUNT(*) AS n FROM outbox`).get() as { n: number }).n;
-    if (count <= MAX_BUFFERED_EVENTS) return 0;
+      const count = (this.db.query(`SELECT COUNT(*) AS n FROM outbox`).get() as { n: number }).n;
+      if (count <= MAX_BUFFERED_EVENTS) return 0;
 
-    const excess = count - MAX_BUFFERED_EVENTS;
-    this.db.query(`DELETE FROM outbox WHERE id IN (SELECT id FROM outbox ORDER BY id ASC LIMIT ?)`).run(excess);
-    return excess;
+      const excess = count - MAX_BUFFERED_EVENTS;
+      const evicted = this.db
+        .query(
+          `DELETE FROM outbox WHERE id IN (
+             SELECT id FROM outbox WHERE kind != 'chain.anomaly' ORDER BY id ASC LIMIT ?
+           )`,
+        )
+        .run(excess);
+      // WHAT WAS ACTUALLY REMOVED, not what was asked for. With anomalies
+      // exempt the two can differ, and the caller logs this number - reporting
+      // an eviction that did not happen would send an operator looking for
+      // events that are still there.
+      return Number(evicted.changes);
+    })();
   }
 
   dueEvents(limit: number, now = Date.now()): OutboundEvent[] {

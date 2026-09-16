@@ -32,6 +32,30 @@ export const CONTRACT_NAME = /^[A-Z][A-Za-z0-9]{0,63}$/;
 /// and contract entries, and matched by the implicit keys `names`/`converter`.
 export const MANIFEST_KEY = /^[a-z][a-z0-9]{0,15}$/;
 
+/// KEYS THIS STORE'S SCHEMA HAS ALREADY SPOKEN FOR (finding 5).
+///
+/// A token key is written into `stage_spend.token` and `intents.token` as a
+/// VALUE, so a key that happens to spell a COLUMN name is not a corruption by
+/// itself. It is a trap for the next person who writes a migration: the v6 -> v7
+/// step's `SELECT agent_id, stage, <key>, spent` reads as "select the key" and
+/// would become "select the column" the moment somebody interpolates rather
+/// than binds - which is precisely what that step did until this release.
+///
+/// So the collision is refused where an operator can still fix it - at manifest
+/// load, by name - rather than left as a rule a future migration has to
+/// remember. Every one of these matches MANIFEST_KEY, so none of them is
+/// hypothetical; `agent_id` and `tx_hash` do not, and are left out rather than
+/// listed for symmetry, because a list containing unreachable entries invites
+/// the reader to trust it as a description of the schema.
+export const RESERVED_MANIFEST_KEYS = new Set([
+  'amount',
+  'emissions',
+  'spent',
+  'stage',
+  'token',
+  'topic',
+]);
+
 export interface TokenModule {
   key: string;
   address: Address;

@@ -11,6 +11,34 @@
 #   ./svc/scripts/verify-calls.sh
 set -euo pipefail
 
+# PARCEL B: A QUIET STEP THAT SPEAKS WHEN IT FAILS.
+#
+# The expensive setup steps discarded their output entirely, so a failure inside
+# one left `set -e` killing the script with the log ending mid-step and nothing
+# to read. Measured on this branch: a compose interpolation error reached me as
+# a script that stopped after printing "=== cold start", two layers from its
+# cause.
+#
+# Quiet on success - a green verification is a wall of forge and docker output
+# nobody reads - and the last 40 lines on failure, which is where the reason is.
+# NO `trap ... EXIT` HERE, deliberately. Every one of these scripts sets its own
+# EXIT trap to tear down containers and volumes, and a second `trap` on the same
+# signal REPLACES the first rather than adding to it - so a helper that installed
+# one would leak a stack instead of a temp file. The log is per call and removed
+# on both paths.
+quietly() { # quietly <label> <cmd...> - prints the command's output only if it fails
+  local label=$1; shift
+  local log; log=$(mktemp)
+  if ! "$@" >"$log" 2>&1; then
+    echo "FAIL: $label" >&2
+    echo "--- last 40 lines ---" >&2
+    tail -40 "$log" >&2
+    rm -f "$log"
+    return 1
+  fi
+  rm -f "$log"
+}
+
 IMAGE=${IMAGE:-agent-chain-anvil:dev}
 NAME=${NAME:-agent-chain-anvil-calls-verify}
 VOLUME=${VOLUME:-agent-chain-state-calls-verify}
@@ -81,9 +109,12 @@ KEY=$(cast wallet private-key --mnemonic "$MNEMONIC")
 # has to do both itself: the script writes local.json.pending and never
 # local.json, because a run WITHOUT --broadcast would otherwise hand every
 # service downstream a manifest of contracts nobody mined.
-( cd "$CONTRACTS" && DEPLOYER_PRIVATE_KEY="$KEY" DEPLOYMENTS_DIR="$DEPLOYMENTS" \
+_deploy() {
+  cd "$CONTRACTS" && DEPLOYER_PRIVATE_KEY="$KEY" DEPLOYMENTS_DIR="$DEPLOYMENTS" \
     ALLOW_FRESH_DEPLOY=1 \
-    forge script script/Deploy.s.sol:Deploy --rpc-url "$RPC" --broadcast ) >/dev/null 2>&1
+    forge script script/Deploy.s.sol:Deploy --rpc-url "$RPC" --broadcast
+}
+quietly "the deploy" _deploy
 mv "$DEPLOYMENTS/local.json.pending" "$DEPLOYMENTS/local.json"
 
 PLAY=$(python3 -c "import json;print([m for m in json.load(open('$DEPLOYMENTS/local.json'))['modules'] if m.get('key')=='play'][0]['address'])")

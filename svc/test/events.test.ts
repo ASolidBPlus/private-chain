@@ -6,7 +6,8 @@ import { describe, it, expect } from 'bun:test';
 import { createServer, type Server } from 'node:http';
 import { EventTail } from '../src/events.ts';
 import { spendVia } from '../src/treasury.ts';
-import { Store } from '../src/store.ts';
+import { Store, MAX_BUFFERED_EVENTS } from '../src/store.ts';
+import type { Database } from 'bun:sqlite';
 import type { Chain } from '../src/chain.ts';
 import type { Config } from '../src/config.ts';
 import type { Abi } from 'viem';
@@ -719,7 +720,7 @@ describe('sweepOnce', () => {
     store.setCursor('chain-log-tail', 9n);
 
     expect(await tail.sweepOnce()).toEqual({ confirmed: 1, held: 0 });
-    expect(store.intentTxHash('landed')).toBe('0xaaa');
+    expect(store.intentTxHash('orch:mark', 'landed')).toBe('0xaaa');
     // The money moved, so the budget stays spent.
     expect(store.spentThisStage('orch:mark', store.currentStage(), 'play')).toBe(10n ** 18n);
     store.close();
@@ -736,7 +737,7 @@ describe('sweepOnce', () => {
     const result = await tail.sweepOnce();
     expect(result.confirmed).toBe(0);
     expect(result.held).toBe(1); // and NOT released either - an emission exists
-    expect(store.intentTxHash('foreign')).toBeNull();
+    expect(store.intentTxHash('orch:mark', 'foreign')).toBeNull();
     store.close();
   });
 
@@ -819,7 +820,7 @@ describe('sweepOnce', () => {
 
     // Backdate the reservation a week. A retention rule keyed on age - the one
     // mechanism the stage tests cannot express - would have removed it.
-    store.backdateIntentForTest('ancient-by-clock', Date.now() - 7 * 86_400_000);
+    store.backdateIntentForTest('orch:mark', 'ancient-by-clock', Date.now() - 7 * 86_400_000);
 
     await new EventTail({ token: 'tok' } as Config,
       chainAt(1n, [{ args: { intentId: TOPIC2, from: WALLET }, transactionHash: '0xaaa' }]), store).pollOnce();
@@ -886,8 +887,8 @@ describe('sweepOnce', () => {
 
     expect(await tail.sweepOnce()).toEqual({ confirmed: 1, held: 0 });
 
-    expect(store.intentTxHash('new-stage')).toBe('0xbbb'); // swept
-    expect(store.intentTxHash('old-stage')).toBeNull();    // skipped, not resolved
+    expect(store.intentTxHash('orch:mark', 'new-stage')).toBe('0xbbb'); // swept
+    expect(store.intentTxHash('orch:mark', 'old-stage')).toBeNull();    // skipped, not resolved
     store.close();
   });
 
@@ -926,7 +927,7 @@ describe('sweepOnce', () => {
     await tail.sweepOnce();
 
     // Terminal status, from the store rather than a chain call.
-    expect(store.intentTxHash('terminal')).toBe('0xaaa');
+    expect(store.intentTxHash('orch:mark', 'terminal')).toBe('0xaaa');
     // And the id is spent: a retry is refused WITH the original transaction,
     // never admitted as a fresh reservation.
     expect(
@@ -958,7 +959,7 @@ describe('sweepOnce', () => {
     store.recordEmission({ topic: TOPIC2, txHash: '0xaaa', from: WALLET, isExpectedEmitter: true });
 
     expect((await tail.sweepOnce()).confirmed).toBe(1);
-    expect(store.intentTxHash('unbounded-landed')).toBe('0xaaa');
+    expect(store.intentTxHash('orch:mark', 'unbounded-landed')).toBe('0xaaa');
     store.close();
   });
 
@@ -1444,7 +1445,7 @@ describe('generic decoding', () => {
     // RESOLVED - the first half of this test's own name. Siblings do kill the
     // "record nothing" mutant, so this closed no hole; it stops this test
     // passing for a reason it does not claim.
-    expect(store.intentRecord('call-1')?.emissions).toBe(1);
+    expect(store.intentRecord('orch:a', 'call-1')?.emissions).toBe(1);
     const anomalies = payloads(store).filter((p) => p.kind === 'chain.anomaly');
     expect(anomalies).toHaveLength(0);
     store.close();
@@ -1513,7 +1514,7 @@ describe('generic decoding', () => {
     // describe up, and I fixed that one and did not look for this one - the
     // same assertion, the same file, three hundred lines apart. Zero anomalies
     // is also what an emission nobody recorded produces.
-    expect(store.intentRecord('gold-1')?.emissions).toBe(1);
+    expect(store.intentRecord('orch:a', 'gold-1')?.emissions).toBe(1);
     expect(payloads(store).filter((p) => p.kind === 'chain.anomaly')).toHaveLength(0);
     store.close();
   });
@@ -1582,6 +1583,77 @@ describe('generic decoding', () => {
     const store = new Store(':memory:');
     await new EventTail({} as Config, chain, store).pollOnce();
     expect(asked).toBe(false);
+    store.close();
+  });
+});
+
+// FINDING 28: the buffer's eviction, and what it must never choose.
+//
+// `chain.anomaly` is the one event kind that means something went WRONG - a
+// double emission under an intent this store reserved. It is also, by
+// construction, the kind most likely to be in a buffer that is overflowing,
+// because whatever produced the flood produced it too. Evicting the oldest row
+// whatever it was made the detector's entire output the first thing discarded.
+describe('the outbox evicts, but never an anomaly', () => {
+  // Below the cap this path does not run at all, so the fixture has to fill it.
+  // Slow to write and fast to run: one transaction, 10k inserts.
+  function filled(store: Store, n: number): void {
+    const db = (store as unknown as { db: Database }).db;
+    db.transaction(() => {
+      const ins = db.query(`INSERT INTO outbox (kind, payload, created_at) VALUES (?, ?, ?)`);
+      for (let i = 0; i < n; i++) ins.run('chain.transfer', '{}', Date.now());
+    })();
+  }
+
+  it('keeps the anomaly and drops an ordinary event instead', () => {
+    const store = new Store(':memory:');
+    // The anomaly goes in FIRST, so it is the oldest row - the one the old
+    // eviction would have taken.
+    store.enqueueEvent('chain.anomaly', { kind: 'chain.anomaly', topic: '0xdead' });
+    filled(store, MAX_BUFFERED_EVENTS - 1);
+
+    // One more, which tips it over.
+    const evicted = store.enqueueEvent('chain.transfer', { kind: 'chain.transfer', txHash: '0x2' });
+    expect(evicted).toBe(1);
+
+    const db = (store as unknown as { db: Database }).db;
+    const anomalies = (db.query(`SELECT COUNT(*) AS n FROM outbox WHERE kind = 'chain.anomaly'`).get() as { n: number }).n;
+    // THE VALUE, not "greater than zero": the anomaly is still there, exactly
+    // once, and it was the oldest row in the buffer when the eviction ran.
+    expect(anomalies).toBe(1);
+    store.close();
+  });
+
+  // THE CONTROL: an ordinary oldest row IS evicted, so the row above cannot be
+  // passing because nothing is ever evicted.
+  it('control: an ordinary event at the front is evicted', () => {
+    const store = new Store(':memory:');
+    filled(store, MAX_BUFFERED_EVENTS);
+    const db = (store as unknown as { db: Database }).db;
+    const first = (db.query(`SELECT MIN(id) AS id FROM outbox`).get() as { id: number }).id;
+
+    expect(store.enqueueEvent('chain.transfer', { kind: 'chain.transfer', txHash: '0x3' })).toBe(1);
+
+    const stillThere = db.query(`SELECT 1 FROM outbox WHERE id = ?`).get(first);
+    expect(stillThere).toBeNull();
+    store.close();
+  });
+
+  // ANOMALIES ARE EXEMT FROM BEING CHOSEN, NOT FROM THE CAP. A buffer that is
+  // nothing but anomalies evicts none and grows - the right failure, because an
+  // operator with ten thousand anomalies queued has a problem silence would not
+  // fix, and the count returned says truthfully that nothing was removed.
+  it('reports zero rather than a number nobody removed, when only anomalies are there', () => {
+    const store = new Store(':memory:');
+    const db = (store as unknown as { db: Database }).db;
+    db.transaction(() => {
+      const ins = db.query(`INSERT INTO outbox (kind, payload, created_at) VALUES (?, ?, ?)`);
+      for (let i = 0; i < MAX_BUFFERED_EVENTS; i++) ins.run('chain.anomaly', '{}', Date.now());
+    })();
+
+    expect(store.enqueueEvent('chain.anomaly', { kind: 'chain.anomaly', topic: '0xbeef' })).toBe(0);
+    const n = (db.query(`SELECT COUNT(*) AS n FROM outbox`).get() as { n: number }).n;
+    expect(n).toBe(MAX_BUFFERED_EVENTS + 1);
     store.close();
   });
 });

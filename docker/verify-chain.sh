@@ -24,8 +24,29 @@ MNEMONIC=${ANVIL_MNEMONIC:-"test test test test test test test test test test te
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CONTRACTS_DIR="$(cd "$HERE/../contracts" && pwd)"
 
+# FINDING 29: THIS SCRIPT STAGES INTO A TEMP DIRECTORY AND NEVER INTO THE REPO.
+#
+# It used to `rm -f deployments/local.json`, overwrite `deployments/manifest.json`
+# with its own, and move the result about - so running the verification destroyed
+# the manifest of whatever the developer had deployed, and left THIS script's
+# two-module manifest behind as if it were theirs. A verification that edits the
+# tree it is verifying is one nobody can run twice with confidence.
+#
+# `DEPLOYMENTS_DIR` is already a parameter of Deploy.s.sol's `run()`, so pointing
+# it at a staging directory needs no change to the contracts - only for this
+# script to stop assuming `../deployments`.
+STAGE="$(mktemp -d)"
+export DEPLOYMENTS_DIR="$STAGE"
+
 step() { printf '\n=== %s\n' "$1"; }
-cleanup() { docker rm -f "$NAME" "$NAME-noq" "$NAME-argv" "$NAME-argv-control" >/dev/null 2>&1 || true; docker volume rm "$VOLUME" >/dev/null 2>&1 || true; }
+cleanup() {
+  docker rm -f "$NAME" "$NAME-noq" "$NAME-argv" "$NAME-argv-control" >/dev/null 2>&1 || true
+  docker volume rm "$VOLUME" >/dev/null 2>&1 || true
+  # The staging directory, which exists only for this run. The container and the
+  # volume above are this script's own by name; the repo's deployments/ is no
+  # longer touched at all, which is what finding 29 was about.
+  [ -n "${STAGE:-}" ] && rm -rf "$STAGE"
+}
 trap cleanup EXIT
 
 # THE IMAGE MUST EXIST FIRST. Without it the two leading checks - "refuses
@@ -41,7 +62,6 @@ docker image inspect "$IMAGE" >/dev/null 2>&1 || {
 }
 
 cleanup
-rm -f "$CONTRACTS_DIR/../deployments/local.json"
 
 step "the entrypoint refuses to start without a mnemonic"
 if docker run --rm "$IMAGE" >/dev/null 2>&1; then
@@ -83,7 +103,7 @@ cd "$CONTRACTS_DIR"
 # has no built-in default, so a script that deploys must say what it deploys --
 # and the TLD here is the suffix every name below is registered under. Without
 # this the deploy refuses and every check afterwards is testing nothing.
-cat > "$CONTRACTS_DIR/../deployments/manifest.json" <<'MANIFEST_JSON'
+cat > "$STAGE/manifest.json" <<'MANIFEST_JSON'
 {
   "schema": 1,
   "modules": [
@@ -97,12 +117,12 @@ MANIFEST_JSON
 # script writes local.json.pending and never local.json - a simulation must not
 # be able to hand the rest of the system a manifest of contracts nobody mined.
 ALLOW_FRESH_DEPLOY=1 forge script script/Deploy.s.sol:Deploy --rpc-url "$RPC" --broadcast 2>&1 | grep -E "Deploy:|Compiler run|ONCHAIN EXECUTION|Error" | head -10
-[ -f ../deployments/local.json ] && { echo "FAIL: the script wrote local.json; promotion is the caller's"; exit 1; }
-mv ../deployments/local.json.pending ../deployments/local.json
-cat ../deployments/local.json
+[ -f "$STAGE/local.json" ] && { echo "FAIL: the script wrote local.json; promotion is the caller's"; exit 1; }
+mv "$STAGE/local.json.pending" "$STAGE/local.json"
+cat "$STAGE/local.json"
 
-VEE=$(python3 -c "import json;print([m for m in json.load(open('../deployments/local.json'))['modules'] if m['kind']=='token'][0]['address'])")
-REG=$(python3 -c "import json;print([m for m in json.load(open('../deployments/local.json'))['modules'] if m['kind']=='names'][0]['address'])")
+VEE=$(python3 -c "import json;print([m for m in json.load(open('$STAGE/local.json'))['modules'] if m['kind']=='token'][0]['address'])")
+REG=$(python3 -c "import json;print([m for m in json.load(open('$STAGE/local.json'))['modules'] if m['kind']=='names'][0]['address'])")
 TREASURY=$(cast wallet address --private-key "$KEY")
 
 supply_before=$(cast call "$VEE" "totalSupply()(uint256)" --rpc-url "$RPC")
@@ -117,8 +137,8 @@ forge script script/Deploy.s.sol:Deploy --rpc-url "$RPC" --broadcast 2>&1 | grep
 # THE SKIP PATH WRITES NOTHING, which is the direct statement of "deployed
 # nothing new" - stronger than comparing addresses, because CREATE2 with the
 # same salt and init code gives the same address either way.
-[ -f ../deployments/local.json.pending ] && { echo "FAIL: the second run wrote a manifest"; exit 1; }
-VEE2=$(python3 -c "import json;print([m for m in json.load(open('../deployments/local.json'))['modules'] if m['kind']=='token'][0]['address'])")
+[ -f "$STAGE/local.json.pending" ] && { echo "FAIL: the second run wrote a manifest"; exit 1; }
+VEE2=$(python3 -c "import json;print([m for m in json.load(open('$STAGE/local.json'))['modules'] if m['kind']=='token'][0]['address'])")
 [ "$VEE" = "$VEE2" ] || { echo "FAIL: token address changed: $VEE -> $VEE2"; exit 1; }
 echo "token address unchanged: $VEE2"
 
@@ -126,11 +146,11 @@ step "the OTHER idempotence direction: local.json gone, chain intact (must REFUS
 # ./deployments is a bind mount and chain-state is a named volume, so either can
 # outlive the other. Without this guard the script below deploys a SECOND token
 # and writes it over the file, orphaning the first with every balance in it.
-mv ../deployments/local.json /tmp/local.json.hidden
+mv "$STAGE/local.json" "$STAGE/local.json.hidden"
 # WITHOUT the flag, which is the whole point: the one-shot sets it only on a
 # volume that has never held a deployment, and this volume has.
 if forge script script/Deploy.s.sol:Deploy --rpc-url "$RPC" --broadcast >/tmp/redeploy.log 2>&1; then
-  mv /tmp/local.json.hidden ../deployments/local.json
+  mv "$STAGE/local.json.hidden" "$STAGE/local.json"
   echo "FAIL: redeployed with no local.json - the live token has been orphaned"; exit 1
 fi
 # ASSERTED, NOT GREPPED FOR ITS EXIT STATUS. Under `set -e` a grep that finds
@@ -144,20 +164,20 @@ if [ -z "$refusal" ]; then
   exit 1
 fi
 echo "$refusal"
-[ -f ../deployments/local.json ] && { echo "FAIL: it wrote a local.json anyway"; exit 1; }
-[ -f ../deployments/local.json.pending ] && { echo "FAIL: it wrote a pending manifest anyway"; exit 1; }
+[ -f "$STAGE/local.json" ] && { echo "FAIL: it wrote a local.json anyway"; exit 1; }
+[ -f "$STAGE/local.json.pending" ] && { echo "FAIL: it wrote a pending manifest anyway"; exit 1; }
 echo "refused, and wrote nothing"
-mv /tmp/local.json.hidden ../deployments/local.json
+mv "$STAGE/local.json.hidden" "$STAGE/local.json"
 
 step "a run WITHOUT --broadcast leaves the manifest alone (finding 6)"
 # The reviewer's probe. `forge script` simulates when --broadcast is absent,
 # computing real CREATE2 addresses for contracts it never mines - so a
 # simulation that wrote local.json handed every service downstream a manifest of
 # contracts that do not exist.
-before=$(cat ../deployments/local.json)
+before=$(cat "$STAGE/local.json")
 ALLOW_FRESH_DEPLOY=1 forge script script/Deploy.s.sol:Deploy --rpc-url "$RPC" >/tmp/simulate.log 2>&1 || true
-[ "$(cat ../deployments/local.json)" = "$before" ] || { echo "FAIL: a simulation changed local.json"; exit 1; }
-rm -f ../deployments/local.json.pending
+[ "$(cat "$STAGE/local.json")" = "$before" ] || { echo "FAIL: a simulation changed local.json"; exit 1; }
+rm -f "$STAGE/local.json.pending"
 echo "local.json unchanged by a simulated run"
 
 step "the one-shot never puts the mnemonic on a command line (finding 25)"

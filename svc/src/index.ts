@@ -11,7 +11,7 @@ import { Resolver } from './resolver.ts';
 import { loadPolicyDefaults } from './policy.ts';
 import { Spawner } from './spawn.ts';
 import { Store } from './store.ts';
-import { assertLedgerLifetimeIntact, gatherLifetimeFacts } from './migrate.ts';
+import { assertLedgerLifetimeIntact, assertLedgerNotRestored, gatherLifetimeFacts } from './migrate.ts';
 import { assertDeploymentUnchanged } from './deployment.ts';
 import { Treasury } from './treasury.ts';
 import { EventTail } from './events.ts';
@@ -67,8 +67,7 @@ async function main(): Promise<void> {
   assertDeploymentUnchanged(recordedDeployment, liveDeployment, config.acknowledgeChainReset);
   if (recordedDeployment === null) store.recordDeployment(liveDeployment);
 
-  assertLedgerLifetimeIntact(
-    await gatherLifetimeFacts({
+  const lifetime = await gatherLifetimeFacts({
       store,
       keystore,
       // The default token if there is one, else the registry. The control asks
@@ -79,8 +78,16 @@ async function main(): Promise<void> {
           address: chain.modules.tokens[0]?.address ?? requireNames(chain.modules).address,
         }),
       acknowledged: config.acknowledgeLedgerReset,
-    }),
-  );
+    });
+  // FINDING 22, AND THE ORDER IS PART OF IT. A restored store is a more
+  // specific diagnosis than an empty one; an operator told the wrong one goes
+  // looking in the wrong place.
+  assertLedgerNotRestored(lifetime);
+  assertLedgerLifetimeIntact(lifetime);
+  // RECORDED AFTER BOTH CHECKS PASS, so a refused boot never moves the mark it
+  // was refused against - otherwise the second attempt would start cleanly and
+  // the operator would conclude the first was a glitch.
+  await keystore.recordLedgerWatermark(lifetime.reservations);
   const resolver = new Resolver(chain, store);
   // KIND DEFAULTS ARE OPT-IN as of v0.8.0: unset means NONE, not the shipped
   // example, which nothing loads. Built ONCE and shared, so the spawner's rules

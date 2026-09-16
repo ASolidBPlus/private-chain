@@ -189,6 +189,12 @@ export function readPolicy(path: string, defaultTokenKey?: string): PolicyRead {
       return { unreadable: UNREADABLE, reason: 'not a policy document' };
     }
     const p = parsed as Record<string, unknown>;
+    // A KEY THIS DOCUMENT HAS NEVER HAD IS A WRONG SHAPE, and shape failures
+    // are file-level. A mistyped key at this level is read as absent, which for
+    // `caps` means unbounded.
+    if (!keysKnown(p, POLICY_KEYS, POLICY_KEYS_TOLERATED)) {
+      return { unreadable: UNREADABLE, reason: 'not a policy document' };
+    }
     if (!isNameList(p.allow) || !isNameList(p.deny)) {
       return { unreadable: UNREADABLE, reason: 'not a policy document' };
     }
@@ -199,7 +205,11 @@ export function readPolicy(path: string, defaultTokenKey?: string): PolicyRead {
       }
       // PER ENTRY, not just the map: `caps` being an object says nothing about
       // what is in it, and an entry that is not an object is a shape failure.
-      if (!Object.values(p.caps as Record<string, unknown>).every(isCapEntry)) {
+      if (
+        !Object.values(p.caps as Record<string, unknown>).every(
+          (e) => isCapEntry(e) && keysKnown(e as Record<string, unknown>, TOKEN_CAPS_KEYS),
+        )
+      ) {
         return { unreadable: UNREADABLE, reason: 'not a policy document' };
       }
       return withLists(p, { caps: p.caps as Record<string, TokenCaps> });
@@ -263,6 +273,23 @@ function withLists(p: Record<string, unknown>, rest: Partial<WalletPolicy>): Wal
     ...(p.allow === undefined ? {} : { allow: p.allow as string[] }),
     ...(p.deny === undefined ? {} : { deny: p.deny as string[] }),
   };
+}
+
+/// EVERY KEY A POLICY DOCUMENT MAY CARRY, per level. MIRRORS chain-svc's sets
+/// and must agree with them - the document-level agreement test is what holds
+/// the two together.
+///
+/// Field levels are closed; MAP levels are not. `caps` is keyed by token, and a
+/// deployment's token keys are its own. `agentId` is KNOWN (chain-svc stamps it
+/// on every file it writes) and `frozen` is TOLERATED (every file written before
+/// v0.8.0 carries it) - a rule without those two marks the whole installed base
+/// unreadable, which is the write-path defect arriving through a second door.
+const POLICY_KEYS = new Set(['agentId', 'caps', 'allow', 'deny', 'max_per_tx', 'max_per_stage']);
+const POLICY_KEYS_TOLERATED = new Set(['frozen']);
+const TOKEN_CAPS_KEYS = new Set(['max_per_tx', 'max_per_stage']);
+
+function keysKnown(value: Record<string, unknown>, known: Set<string>, tolerated?: Set<string>): boolean {
+  return Object.keys(value).every((k) => known.has(k) || tolerated?.has(k) === true);
 }
 
 /// A list of names, or absent. Mirrors chain-svc's `isNameList` INCLUDING THE

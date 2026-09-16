@@ -393,7 +393,7 @@ describe('policy enforcement', () => {
       const store = new Store(':memory:');
       const args = { intentId: 'once', agentId: 'orch:a', stage: 's1', amount: vee(10), stageCap: cap, token: 'play' };
       store.reserve(args);
-      store.completeIntent('once', '0xabc');
+      store.completeIntent('orch:a', 'once', '0xabc');
       expect(store.reserve(args)).toEqual({ outcome: 'duplicate', txHash: '0xabc' });
       store.close();
     });
@@ -425,7 +425,7 @@ describe('policy enforcement', () => {
       const store = new Store(':memory:');
       const args = { intentId: 'unsent', agentId: 'orch:a', stage: 's1', amount: vee(100), stageCap: cap, token: 'play' };
       store.reserve(args);
-      store.release('unsent');
+      store.release('orch:a', 'unsent');
       expect(store.spentThisStage('orch:a', 's1', 'play')).toBe(0n);
       expect(store.reserve(args).outcome).toBe('reserved');
       store.close();
@@ -437,8 +437,8 @@ describe('policy enforcement', () => {
       const store = new Store(':memory:');
       const args = { intentId: 'done', agentId: 'orch:a', stage: 's1', amount: vee(100), stageCap: cap, token: 'play' };
       store.reserve(args);
-      store.completeIntent('done', '0xabc');
-      store.release('done');
+      store.completeIntent('orch:a', 'done', '0xabc');
+      store.release('orch:a', 'done');
       expect(store.reserve(args)).toEqual({ outcome: 'duplicate', txHash: '0xabc' });
       store.close();
     });
@@ -496,7 +496,7 @@ describe('policy enforcement', () => {
       store.reserve({ intentId: 'platform-set', agentId: 'orch:a', stage: 's1', amount: vee(400), stageCap: null, token: 'play' });
       expect(store.spentThisStage('orch:a', 's1', 'play')).toBe(vee(100)); // unchanged, correct
 
-      store.release('platform-set');
+      store.release('orch:a', 'platform-set');
 
       // The agent's real hold survives. Before the fix this refunded 400 that
       // was never held, and the clamp floored the result at zero.
@@ -504,31 +504,62 @@ describe('policy enforcement', () => {
       store.close();
     });
 
-    // A5. A review's two separations. `release` takes ONLY an intent id now, so
-    // there is no caller coordinate left to be wrong - but these assert the
-    // behaviour rather than the signature, because a future overload could
-    // reintroduce either.
+    // A5. A review's two separations. `release` takes the WALLET and the id
+    // since v8, and everything else still comes off the row - so the stage and
+    // the amount have no caller coordinate to be wrong, and the wallet now has
+    // one that must MATCH rather than be trusted. These assert the behaviour
+    // rather than the signature, because a future overload could reintroduce
+    // either.
     it('refunds the stage the intent was reserved IN, not one the caller names', () => {
       const store = new Store(':memory:');
       store.reserve({ intentId: 'i', agentId: 'orch:a', stage: 's1', amount: vee(100), stageCap: cap, token: 'play' });
       store.reserve({ intentId: 'j', agentId: 'orch:a', stage: 's2', amount: vee(300), stageCap: cap, token: 'play' });
 
-      store.release('i');
+      store.release('orch:a', 'i');
 
       expect(store.spentThisStage('orch:a', 's1', 'play')).toBe(0n);   // refunded
       expect(store.spentThisStage('orch:a', 's2', 'play')).toBe(vee(300)); // untouched
       store.close();
     });
 
-    it('refunds the wallet the intent belongs TO, not another one', () => {
+    // TWO WAYS TO REFUND THE WRONG WALLET, and v8 splits them.
+    //
+    // Before, `release` took an id alone, found whatever row had it, and
+    // refunded the wallet that row named - so the property was "trust the row,
+    // not the caller". Now the wallet is a coordinate of the lookup, which
+    // makes a second failure possible that could not exist before: asking to
+    // release SOMEBODY ELSE'S id. A test that only kept the first assertion
+    // would pass while that one went unguarded.
+    it('refunds the wallet the intent belongs TO, and nobody else', () => {
       const store = new Store(':memory:');
       store.reserve({ intentId: 'i', agentId: 'orch:a', stage: 's1', amount: vee(100), stageCap: cap, token: 'play' });
       store.reserve({ intentId: 'k', agentId: 'orch:b', stage: 's1', amount: vee(200), stageCap: cap, token: 'play' });
 
-      store.release('i');
+      store.release('orch:a', 'i');
 
-      expect(store.spentThisStage('orch:a', 's1', 'play')).toBe(0n);
-      expect(store.spentThisStage('orch:b', 's1', 'play')).toBe(vee(200)); // another wallet's budget is not touched
+      expect(store.spentThisStage('orch:a', 's1', 'play')).toBe(0n);        // refunded
+      expect(store.spentThisStage('orch:b', 's1', 'play')).toBe(vee(200));  // untouched
+      store.close();
+    });
+
+    it('releasing ANOTHER wallet\'s intent id cancels nothing and refunds nothing', () => {
+      const store = new Store(':memory:');
+      store.reserve({ intentId: 'i', agentId: 'orch:a', stage: 's1', amount: vee(100), stageCap: cap, token: 'play' });
+      store.reserve({ intentId: 'k', agentId: 'orch:b', stage: 's1', amount: vee(200), stageCap: cap, token: 'play' });
+
+      // orch:b asking to release the string orch:a reserved. Under the old key
+      // this DELETEd alice's open reservation and credited her budget back on
+      // bob's say-so.
+      store.release('orch:b', 'i');
+
+      expect(store.spentThisStage('orch:a', 's1', 'play')).toBe(vee(100));  // still held
+      expect(store.spentThisStage('orch:b', 's1', 'play')).toBe(vee(200));  // still held
+      // ...and alice's reservation is still there, so her own retry is a
+      // duplicate rather than a fresh slot.
+      expect(
+        store.reserve({ intentId: 'i', agentId: 'orch:a', stage: 's1', amount: vee(100), stageCap: cap, token: 'play' })
+          .outcome,
+      ).toBe('duplicate');
       store.close();
     });
 
@@ -537,7 +568,7 @@ describe('policy enforcement', () => {
     it('refunds what was held even when the caller names a different amount', () => {
       const store = new Store(':memory:');
       store.reserve({ intentId: 'x', agentId: 'orch:a', stage: 's1', amount: vee(100), stageCap: cap, token: 'play' });
-      store.release('x');
+      store.release('orch:a', 'x');
       expect(store.spentThisStage('orch:a', 's1', 'play')).toBe(0n);
       store.close();
     });
@@ -545,7 +576,7 @@ describe('policy enforcement', () => {
     it('refunds nothing for an intent that was never reserved', () => {
       const store = new Store(':memory:');
       take(store, 'orch:a', 's1', vee(500), cap);
-      store.release('never-existed');
+      store.release('orch:a', 'never-existed');
       // The budget stands. The old code refunded unconditionally and merely
       // CLAMPED at zero, which is a different property and the wrong one: it
       // made an unknown intent id a way to zero a wallet's stage spend.
@@ -557,8 +588,8 @@ describe('policy enforcement', () => {
       const store = new Store(':memory:');
       const args = { intentId: 'twice', agentId: 'orch:a', stage: 's1', amount: vee(100), stageCap: cap, token: 'play' };
       store.reserve(args);
-      store.release('twice');
-      store.release('twice');
+      store.release('orch:a', 'twice');
+      store.release('orch:a', 'twice');
       expect(store.spentThisStage('orch:a', 's1', 'play')).toBe(0n);
       store.close();
     });
@@ -571,9 +602,9 @@ describe('policy enforcement', () => {
       const capOf100 = vee(100);
       const args = { intentId: 'landed', agentId: 'orch:a', stage: 's1', amount: vee(100), stageCap: { cap: capOf100 }, token: 'play' };
       expect(store.reserve(args).outcome).toBe('reserved');
-      store.completeIntent('landed', '0xabc');
+      store.completeIntent('orch:a', 'landed', '0xabc');
 
-      store.release('landed');
+      store.release('orch:a', 'landed');
 
       expect(store.reserve(args)).toEqual({ outcome: 'duplicate', txHash: '0xabc' });
       expect(store.spentThisStage('orch:a', 's1', 'play')).toBe(vee(100));

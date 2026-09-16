@@ -12,3 +12,6 @@ chain.env
 # The typecheck:all failure diagnostic: a local artefact of a failing run, never
 # committed.
 .typecheck-failure.log
+
+# codegraph index
+.codegraph/

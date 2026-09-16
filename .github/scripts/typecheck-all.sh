@@ -77,9 +77,34 @@ _diag() {
     # REDACTED, NOT DROPPED. A wrong registry is a plausible cause of a
     # cold-tree install difference, which is this defect's whole shape, so the
     # host has to survive — only the userinfo goes.
+    # FINDING 30: SET-OR-UNSET, AND FOR A REGISTRY THE HOST.
+    #
+    # The values went in whole, with only URL userinfo redacted. That guarded
+    # the one shape somebody had thought of: `NODE_OPTIONS` carries arbitrary
+    # flags including `--require /path/to/anything`, `BUN_INSTALL` and `TMPDIR`
+    # are filesystem paths that describe a machine, and a registry URL can carry
+    # a token in a query string rather than in userinfo - where the sed above
+    # does not look. This file is printed to the CI log, which is a published
+    # surface.
+    #
+    # WHAT THE DIAGNOSTIC IS FOR decides what it needs: it exists to explain why
+    # a cold tree installs differently from a warm one, and for that "was this
+    # set at all" answers nearly every question. The exception is the registry
+    # pair, where a WRONG HOST is itself the plausible cause - so those keep
+    # their host, and nothing else.
     for v in CI GITHUB_ACTIONS NODE_ENV NODE_OPTIONS TSC_COMPILE_ON_ERROR \
-             BUN_INSTALL BUN_CONFIG_REGISTRY npm_config_registry TMPDIR; do
-      echo "env $v = ${!v:-<unset>}" | sed 's|//[^/@]*@|//<redacted>@|g'
+             BUN_INSTALL TMPDIR; do
+      echo "env $v = $([ -n "${!v:-}" ] && echo set || echo '<unset>')"
+    done
+    for v in BUN_CONFIG_REGISTRY npm_config_registry; do
+      # The host alone: scheme, userinfo, path and query all go. `<unset>` and
+      # `set-but-unparseable` are different answers and both are worth having.
+      if [ -z "${!v:-}" ]; then
+        echo "env $v = <unset>"
+      else
+        _host=$(printf '%s' "${!v}" | sed -n 's|^[a-zA-Z][a-zA-Z0-9+.-]*://\([^/@]*@\)\?\([^/:?#]*\).*|\2|p')
+        echo "env $v = host ${_host:-<unparseable>}"
+      fi
     done
     echo "node_modules    : $([ -d node_modules ] && echo present || echo ABSENT)"
     echo "per-package node_modules:"

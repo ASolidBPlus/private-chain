@@ -23,6 +23,22 @@ fi
 
 STATE_FILE="${ANVIL_STATE_FILE:-/state/anvil.json}"
 
+# FINDING 9: ONE ORIGIN, NOT ALL OF THEM.
+#
+# anvil's default is `--allow-origin *`, which sets
+# `Access-Control-Allow-Origin: *` on the JSON-RPC endpoint - so ANY page the
+# facilitator's browser loads can make RPC calls to this node. The node is bound
+# to 127.0.0.1 by compose, and that is exactly the reach a browser has: a
+# same-machine origin is not a barrier to it. On a chain where the treasury key
+# signs, "any web page may call eth_sendTransaction" is worth one flag.
+#
+# THE VALUE IS MEASURED, not chosen: Otterscan is the one browser client, and
+# compose publishes it at `127.0.0.1:5100:80` - so `http://127.0.0.1:5100` is
+# the origin its pages actually carry. Overridable, because a deployment that
+# serves it elsewhere needs to say so, and a wrong value here fails visibly (the
+# block explorer stops loading) rather than silently.
+ALLOW_ORIGIN="${ANVIL_ALLOW_ORIGIN:-http://127.0.0.1:5100}"
+
 # --state both LOADS the file when it exists and DUMPS to it, so there is no
 # separate --load-state branch to write; a cold start with no file just begins
 # empty. --state-interval 5 leaves up to 5s of writes in memory only: anvil
@@ -53,4 +69,5 @@ exec anvil \
   --mnemonic "$ANVIL_MNEMONIC" \
   --state "$STATE_FILE" \
   --state-interval 5 \
+  --allow-origin "$ALLOW_ORIGIN" \
   "$@"

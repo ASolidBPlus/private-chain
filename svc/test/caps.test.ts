@@ -22,7 +22,8 @@
 import { describe, it, expect } from 'bun:test';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   capsFor,
   isCap,
@@ -34,6 +35,7 @@ import {
   loadPolicyDefaults,
   mergePolicy,
   droppedPatternsLogged,
+  WALLET_KINDS,
   type AgentPolicy,
 } from '../src/policy.ts';
 import { HttpError } from '../src/errors.ts';
@@ -458,5 +460,73 @@ describe('every value isCap accepts is usable by everything that consumes a cap'
         }
       }
     }
+  });
+});
+
+// THE SHIPPED EXAMPLE LOADS, and this row exists because nothing else loads it.
+//
+// `policy-defaults.example.json` became opt-in at v0.8.0: the service reads it
+// only when POLICY_DEFAULTS_FILE points at it, and nothing in this repo does.
+// A file that ships as the documented starting point and is parsed by no test
+// rots silently - and the unknown-key rule above is exactly the kind of change
+// that would rot it, since a key the example uses and the loader does not know
+// is now a refusal rather than a no-op.
+describe('the shipped policy defaults example', () => {
+  it('loads clean through loadPolicyDefaults', () => {
+    const path = join(dirname(fileURLToPath(import.meta.url)), '..', 'policy-defaults.example.json');
+    const tokenKeys = ['play', 'gold'];
+    const defaults = loadPolicyDefaults(path, 'play', tokenKeys, () => {});
+    // NOT just "it did not throw": every kind is present andcarries the
+    // three fields the type promises, so a loader that silently returned an
+    // empty object would fail here.
+    for (const kind of WALLET_KINDS) {
+      expect(defaults[kind]).toBeDefined();
+      expect(Array.isArray(defaults[kind].allow)).toBe(true);
+      expect(Array.isArray(defaults[kind].deny)).toBe(true);
+    }
+  });
+
+  // `_comment` is the file's documented stand-in for JSON's missing comment
+  // syntax, and it works because the loader INDEXES the top level by
+  // WALLET_KINDS rather than enumerating it. The unknown-key rule is applied at
+  // the FIELD levels only, for exactly this reason.
+  it('tolerates _comment at the top level, which is a map and not a field level', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'defaults-'));
+    const path = join(dir, 'd.json');
+    writeFileSync(path, JSON.stringify({
+      _comment: 'the game owner tunes these',
+      org: { caps: { play: { max_per_tx: '1', max_per_stage: '2' } }, allow: ['*'], deny: [] },
+      agent: { caps: { play: { max_per_tx: '1', max_per_stage: '2' } }, allow: ['*'], deny: [] },
+      burner: { caps: { play: { max_per_tx: '1', max_per_stage: '2' } }, allow: ['*'], deny: [] },
+    }));
+    expect(() => loadPolicyDefaults(path, 'play', ['play'], () => {})).not.toThrow();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('refuses an unknown key inside a KIND, naming it', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'defaults-'));
+    const path = join(dir, 'd.json');
+    const good = { caps: { play: { max_per_tx: '1', max_per_stage: '2' } }, allow: ['*'], deny: [] };
+    writeFileSync(path, JSON.stringify({
+      org: { ...good, alloww: ['*'] },
+      agent: good,
+      burner: good,
+    }));
+    expect(() => loadPolicyDefaults(path, 'play', ['play'], () => {})).toThrow(/unknown key "alloww"/);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('refuses an unknown key inside a TOKEN entry, naming the token and the key', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'defaults-'));
+    const path = join(dir, 'd.json');
+    const good = { caps: { play: { max_per_tx: '1', max_per_stage: '2' } }, allow: ['*'], deny: [] };
+    writeFileSync(path, JSON.stringify({
+      org: { ...good, caps: { play: { max_per_tx: '1', max_per_stage_typo: '2' } } },
+      agent: good,
+      burner: good,
+    }));
+    expect(() => loadPolicyDefaults(path, 'play', ['play'], () => {}))
+      .toThrow(/token "play": unknown key "max_per_stage_typo"/);
+    rmSync(dir, { recursive: true, force: true });
   });
 });

@@ -202,7 +202,7 @@ async function getReverse({ services, param }: RouteContext): Promise<unknown> {
 ///   broadcast - a hash exists; the chain has not confirmed it yet.
 ///   confirmed - the receipt says success.
 ///   failed    - the receipt says reverted. The money did NOT move.
-async function getIntent({ services, param, principal }: RouteContext): Promise<unknown> {
+async function getIntent({ services, param, principal, url }: RouteContext): Promise<unknown> {
   const intentId = decodeURIComponent(param ?? '');
   if (intentId === '') throw new HttpError('invalid_request', 'intent id is required');
 
@@ -214,10 +214,33 @@ async function getIntent({ services, param, principal }: RouteContext): Promise<
   // make the error an existence oracle: guess ids until one answers 403 and you
   // have confirmed another wallet's intent. This is why the ownership check
   // does not get to throw its own error.
-  const record = services.store.intentRecord(intentId);
-  const mine =
-    record !== null && (principal.scope === 'platform' || principal.agentId === record.agentId);
-  if (!mine) throw new HttpError('unknown_intent', `no intent ${intentId}`);
+  // ASKED UNDER THE PRINCIPAL'S OWN ID (v8, finding 1), so ownership is the
+  // lookup rather than a comparison after one. Keyed on the id alone, a wallet
+  // asking about its OWN intent could be handed somebody else's row - the
+  // comparison below would then fail and answer `unknown_intent` about an
+  // intent the caller really has.
+  //
+  // `?wallet=` IS THE COORDINATE THE ROUTE LACKED, not a new power. Intents are
+  // per wallet now, so a platform lookup without one is underdetermined by
+  // construction, and an operator reconciling a specific wallet's stuck intent
+  // needs a way to name it that is not a guess. Without it, platform scope
+  // still gets the unambiguous-or-nothing read.
+  //
+  // A WALLET MAY NOT USE IT. Its own id is the only one it can ask under, so a
+  // `wallet` parameter from wallet scope is either redundant or an attempt to
+  // read somebody else's - refused either way rather than ignored, because an
+  // ignored parameter is one a caller believes worked.
+  const wanted = url.searchParams.get('wallet');
+  if (wanted !== null && principal.scope !== 'platform') {
+    throw new HttpError('invalid_request', 'wallet is platform scope; your own intents need no wallet');
+  }
+  const record =
+    principal.scope === 'platform'
+      ? wanted !== null
+        ? services.store.intentRecord(wanted, intentId)
+        : services.store.intentRecordUnambiguous(intentId)
+      : services.store.intentRecord(principal.agentId, intentId);
+  if (record === null) throw new HttpError('unknown_intent', `no intent ${intentId}`);
 
   // ANSWERED FROM THE STORE, not by a chain call. The tail already records
   // every IntentTransfer against the intent that authorised it, so the question
@@ -775,7 +798,20 @@ export async function handle(services: Services, req: IncomingMessage, res: Serv
       // The detail may name a key file path or an RPC URL; log it, never ship it.
       console.error('chain-svc: unhandled error', err);
     }
-    return send(res, httpError.status, errorBody(httpError), deprecated ? { ...DEPRECATION_HEADERS } : {});
+    // FINDING 10: `internal_error` SHIPS `{error}` AND NOTHING ELSE.
+    //
+    // `toHttpError` already strips an unknown throwable to a bare 500 - but a
+    // 500 CONSTRUCTED here keeps whatever detail it was given, and five of them
+    // are in the keystore: "key file is not valid JSON", "key file could not be
+    // decrypted", "refusing to overwrite an existing key file". Each tells an
+    // unauthenticated-for-this-wallet caller something true about the state of
+    // the file holding somebody's key, and none of it is actionable by anyone
+    // but an operator - who has the log line above, with the throwable itself.
+    //
+    // At the BOUNDARY rather than at each construction, so a sixth one written
+    // next year is covered without anybody remembering this rule.
+    const wire = httpError.code === 'internal_error' ? new HttpError('internal_error') : httpError;
+    return send(res, wire.status, errorBody(wire), deprecated ? { ...DEPRECATION_HEADERS } : {});
   }
 }
 

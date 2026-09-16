@@ -31,7 +31,7 @@ import type { Database } from 'bun:sqlite';
 
 /// Bumped whenever the schema changes. A store stamped HIGHER than this was
 /// written by a newer binary and is refused - see `migrate`.
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 export class SchemaError extends Error {
   constructor(
@@ -191,6 +191,17 @@ const NEW_TABLE_COLUMNS: ReadonlyArray<[string, string]> = [
   // component - the numbered step recreates the table, so `createTables` makes
   // it complete on a fresh store and the reconciliation never visits it.
   ['stage_spend', 'token'],
+  // FINDING 22: the ledger watermark's store half. A NEW TABLE, so it arrives
+  // complete from `createTables` and is classified here rather than ALTERed -
+  // `reservations` has a NOT NULL default and `id` is a primary key with a
+  // CHECK, neither of which ALTER TABLE can add.
+  //
+  // NO NUMBERED STEP AND NO VERSION BUMP: an existing store gets the table
+  // empty, the seed row sets the counter to 0, and the keystore has no
+  // watermark yet - so the first boot after this ships ESTABLISHES the mark
+  // rather than accusing anyone on a history the store never recorded.
+  ['ledger_facts', 'id'],
+  ['ledger_facts', 'reservations'],
 ];
 
 export function classifiedColumns(): Set<string> {
@@ -210,6 +221,21 @@ function tableExists(db: Database, table: string): boolean {
 function columnsOf(db: Database, table: string): Set<string> {
   const rows = db.query(`PRAGMA table_info(${table})`).all() as { name: string }[];
   return new Set(rows.map((r) => r.name));
+}
+
+/// The PRIMARY KEY columns of a table, in key order.
+///
+/// `pk` in `table_info` is 0 for a non-key column and 1..n for the position
+/// within a composite key, so this distinguishes `PRIMARY KEY (intent_id)` from
+/// `PRIMARY KEY (agent_id, intent_id)` - which `columnsOf` cannot, both having
+/// exactly the same columns. The v8 step turns on the KEY and not on a column,
+/// so it needs a guard that can see one.
+function primaryKeyOf(db: Database, table: string): string[] {
+  const rows = db.query(`PRAGMA table_info(${table})`).all() as { name: string; pk: number }[];
+  return rows
+    .filter((r) => r.pk > 0)
+    .sort((a, b) => a.pk - b.pk)
+    .map((r) => r.name);
 }
 
 /// Applied AFTER the `CREATE TABLE IF NOT EXISTS` block, so a wholly-missing
@@ -302,7 +328,25 @@ const NUMBERED: ReadonlyArray<{
         );
       }
 
-      const key = JSON.stringify(defaultKey);
+      // FINDING 5: THE KEY IS BOUND, NEVER INTERPOLATED.
+      //
+      // It went in through `JSON.stringify` into a `db.exec` string. A token key
+      // is operator input - it comes off the manifest - and JSON quoting is not
+      // SQL quoting: JSON escapes a quote as \" where SQL wants ''.
+      //
+      // NOT EXPLOITABLE TODAY, and that is exactly the reason to change it.
+      // `MANIFEST_KEY` is `^[a-z][a-z0-9]{0,15}$`, so a key cannot contain a
+      // quote and the two spellings never part company. The interpolation is
+      // therefore safe BECAUSE OF A RULE IN ANOTHER FILE - and it is the sort of
+      // rule that gets widened (a key with a dash, a key with a dot) by someone
+      // who has no reason to know a migration's string concatenation depends on
+      // it. Binding removes the coupling rather than the symptom.
+      //
+      // `db.exec` cannot take parameters, so the statements are split: the DDL
+      // and the drops stay in `exec`, and the two that carry the key become
+      // prepared statements. SAME TRANSACTION - the caller wraps every numbered
+      // step in one - so a crash between them leaves the store at v6 rather
+      // than half rekeyed.
       db.exec(`
         CREATE TABLE stage_spend_v7 (
           agent_id TEXT NOT NULL,
@@ -311,18 +355,128 @@ const NUMBERED: ReadonlyArray<{
           spent    TEXT NOT NULL,
           PRIMARY KEY (agent_id, stage, token)
         );
-        INSERT INTO stage_spend_v7 (agent_id, stage, token, spent)
-          SELECT agent_id, stage, ${key}, spent FROM stage_spend;
+      `);
+      db.query(
+        `INSERT INTO stage_spend_v7 (agent_id, stage, token, spent)
+           SELECT agent_id, stage, ?, spent FROM stage_spend`,
+      ).run(defaultKey);
+      db.exec(`
         DROP TABLE stage_spend;
         ALTER TABLE stage_spend_v7 RENAME TO stage_spend;
-        UPDATE intents SET token = ${key} WHERE token IS NULL;
-        PRAGMA user_version = 7;
       `);
+      db.query(`UPDATE intents SET token = ? WHERE token IS NULL`).run(defaultKey);
+      db.exec(`PRAGMA user_version = 7;`);
+    },
+  },
+  {
+    to: 8,
+    // GUARDED ON THE KEY, not on a column and not on the version: the columns
+    // are identical either side of this step, so `columnsOf` cannot tell them
+    // apart, and a fresh store is created at the CURRENT shape and stamped 0
+    // until the end of `migrate`.
+    applies: (db) =>
+      tableExists(db, 'intents') && primaryKeyOf(db, 'intents').join(',') === 'intent_id',
+    up: (db) => {
+      // THE KEY GAINS THE WALLET (finding 1). An intent id is a string the
+      // CALLER chooses, so a globally unique key made one wallet's choice
+      // collide with another's: bob reserving an id alice had used got back
+      // ALICE's txHash, moved no money, and was told he had succeeded.
+      //
+      // A REBUILD rather than an ALTER, because sqlite cannot change a primary
+      // key in place. Every column is carried across by name - no `SELECT *`,
+      // which would silently reorder if the table's column order ever differs
+      // from this list, and pair each value with the wrong column.
+      //
+      // NO DEDUPLICATION AND NONE POSSIBLE. Under the old key an id was unique
+      // across the store, so there are no colliding rows to resolve: every
+      // existing row moves unchanged and keeps its meaning. This migration
+      // cannot lose an intent, and that is a property of the OLD key rather
+      // than of the copy.
+      //
+      // The rows' `topic` is carried as it stands - keccak256(intent_id) for
+      // everything written before v8. Broadcast reads the topic FROM THE ROW,
+      // so a pre-v8 intent keeps working with no special case, and only intents
+      // reserved from here on get the wallet-namespaced form.
+      db.exec(`
+        CREATE TABLE intents_v8 (
+          intent_id  TEXT NOT NULL,
+          agent_id   TEXT NOT NULL,
+          stage      TEXT NOT NULL,
+          amount     TEXT NOT NULL,
+          tx_hash    TEXT,
+          held_wei   TEXT NOT NULL DEFAULT '0',
+          topic      TEXT,
+          emissions  INTEGER NOT NULL DEFAULT 0,
+          first_tx   TEXT,
+          first_from TEXT,
+          reserved_at_block TEXT,
+          id_source  TEXT,
+          call_contract  TEXT,
+          call_function  TEXT,
+          call_args_hash TEXT,
+          created_at INTEGER NOT NULL,
+          -- LAST, because that is where a FRESH store has it: token is not in
+          -- the declared DDL at all, it is an ADDITIVE column (v7), appended by
+          -- the reconciliation that runs before this loop. Declaring it here in
+          -- its alphabetical or logical place would give a migrated store a
+          -- different column ORDER from a fresh one - invisible to every query,
+          -- and exactly the drift the schema-equality test exists to catch.
+          -- reserved_at_block is TEXT for the same reason: measured off a live
+          -- table, not inferred from the name.
+          token      TEXT,
+          PRIMARY KEY (agent_id, intent_id)
+        );
+        INSERT INTO intents_v8 (intent_id, agent_id, stage, amount, tx_hash, held_wei, topic,
+                                emissions, first_tx, first_from, reserved_at_block, id_source,
+                                call_contract, call_function, call_args_hash, created_at, token)
+          SELECT intent_id, agent_id, stage, amount, tx_hash, held_wei, topic,
+                 emissions, first_tx, first_from, reserved_at_block, id_source,
+                 call_contract, call_function, call_args_hash, created_at, token
+            FROM intents;
+        DROP TABLE intents;
+        ALTER TABLE intents_v8 RENAME TO intents;
+        PRAGMA user_version = 8;
+      `);
+      // `intents_topic` WENT WITH THE DROP, and this step does not rebuild it:
+      // `createIndexes()` does, and it is called AFTER this loop for exactly
+      // this reason (see `migrate`). Recreating it here would be a second place
+      // that has to agree with the index list.
     },
   },
 ];
 
 export function migrate(
+  db: Database,
+  createTables: () => void,
+  createIndexes: () => void,
+): void {
+  // FINDING 13: ONE WRITER AT A TIME, AND THE OTHER WAITS FOR A FINISHED STORE.
+  //
+  // `BEGIN IMMEDIATE` takes the write lock at the START of the transaction
+  // rather than at the first write. The difference is the whole fix: with a
+  // deferred transaction both processes read `user_version` as 6, both decide
+  // to migrate, and the second discovers the conflict half way through its own
+  // rewrite. With an immediate one the second process blocks on the lock (for
+  // `busy_timeout`, set in the Store constructor), and when it gets in it reads
+  // a version the first process already stamped - so it finds nothing to do.
+  //
+  // The whole of migrate() is inside it, INCLUDING the reads, because the read
+  // that must not be stale is `user_version` itself.
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    migrateInTransaction(db, createTables, createIndexes);
+    db.exec('COMMIT');
+  } catch (err) {
+    // A ROLLBACK THAT ITSELF THROWS MUST NOT REPLACE THE REAL ERROR. The
+    // interesting failure is the one that got us here - a schema refusal names
+    // what an operator has to do - and "cannot rollback, no transaction is
+    // active" would bury it.
+    try { db.exec('ROLLBACK'); } catch { /* the transaction is already gone */ }
+    throw err;
+  }
+}
+
+function migrateInTransaction(
   db: Database,
   createTables: () => void,
   createIndexes: () => void,
@@ -373,28 +527,48 @@ export function migrate(
     }
   }
 
-  // AFTER the reconciliation, and this is why the indexes are a separate thunk
-  // rather than the tail of one DDL block: `intents_topic` indexes `topic`, a
-  // column the baseline above may have just added. Creating it alongside the
-  // tables made the migration die on the very store it exists to repair, with
-  // `no such column: topic` - the original failure, moved four lines. An index
-  // can depend on a migrated column, so it is built once the columns are
-  // settled and never before.
-  createIndexes();
-
   // NUMBERED MIGRATIONS, applied in order for a store stamped BELOW each
   // entry's `to`. They run after createTables() and after the additive
   // reconciliation, so an entry can assume every table exists and every
   // additive column is present.
   //
-  // Each runs inside one transaction and stamps its own version as its last
-  // statement, so a crash between two entries leaves the store at the last
-  // COMPLETED version rather than half-way through one.
+  // Each stamps its own version as its last statement. The TRANSACTION is the
+  // outer one now (finding 13), so a crash leaves the store at the version it
+  // started from rather than at the last completed step - equally consistent,
+  // and it resumes because the steps are guarded on the schema.
   for (const step of NUMBERED) {
     if (version >= step.to) continue;
     if (!step.applies(db)) continue;
-    db.transaction(() => step.up(db))();
+    // NOT `db.transaction(...)` ANY MORE: the whole of `migrate` is already
+    // inside one (see above), and sqlite has no nested transactions - bun's
+    // wrapper would issue a SAVEPOINT at best and a second BEGIN at worst.
+    //
+    // The per-step atomicity it provided is now the outer transaction's. Not
+    // stronger, and not weaker: a crash used to leave the store at the last
+    // COMPLETED step and now leaves it at the version it started from. Both are
+    // consistent states and both resume correctly on the next boot, because
+    // every step is guarded on the SCHEMA rather than on the version - so
+    // redoing the ones that already applied is a no-op.
+    step.up(db);
   }
+
+  // AFTER EVERYTHING, and the position moved at v8 rather than being tidied.
+  //
+  // It has always had to run after the additive reconciliation: `intents_topic`
+  // indexes `topic`, a column the baseline may have just added, and creating it
+  // alongside the tables made the migration die on the very store it exists to
+  // repair with `no such column: topic`. That reason still holds.
+  //
+  // What v8 adds is the other end. A numbered step that REBUILDS a table drops
+  // every index on it - `DROP TABLE intents` takes `intents_topic` with it - so
+  // an index built before the loop is gone by the time the loop finishes, and
+  // the store runs unindexed until some later boot happens to rebuild it. Here
+  // that is a topic lookup on every emission.
+  //
+  // So: after the columns are settled AND after the tables are their final
+  // shape. The thunk is `CREATE INDEX IF NOT EXISTS`, so it is a no-op on the
+  // stores that never entered the loop.
+  createIndexes();
 
   if (version !== SCHEMA_VERSION) db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
 }
@@ -461,6 +635,17 @@ export interface LifetimeFacts {
   /// The operator has stated they intend to end the game's idempotency
   /// lifetime. The one legitimate reason for this state to exist.
   acknowledged: boolean;
+  /// FINDING 22. Every intent this STORE has ever reserved, monotonically -
+  /// never how many exist, because `release` deletes rows.
+  reservations: number;
+  /// The highest value the KEYSTORE has seen that counter reach, or NULL when
+  /// it has never recorded one. A different volume, which is the only thing
+  /// that makes the comparison mean anything: a restored store brings its own
+  /// counter back with it, and cannot bring this one.
+  ///
+  /// Null and zero are different facts. Null is a keystore that has not spoken
+  /// yet; zero is one that has, and said the store had reserved nothing.
+  watermark: number | null;
 }
 
 /// Gathers the three facts. A SEAM RATHER THAN INLINE CODE IN THE ENTRYPOINT,
@@ -489,8 +674,8 @@ export interface LifetimeFacts {
 /// incident that trips this control is an operator doing volume surgery, which
 /// is exactly when a neighbouring volume also fails to attach.
 export async function gatherLifetimeFacts(deps: {
-  store: { intentsEmpty(): boolean; walletsRecorded(): number };
-  keystore: { agentCount(): Promise<number> };
+  store: { intentsEmpty(): boolean; walletsRecorded(): number; reservationsEverMade(): number };
+  keystore: { agentCount(): Promise<number>; ledgerWatermark(): Promise<number | null> };
   /// `getCode` rather than the deployments file: the file records what was
   /// deployed ONCE, and the question is what is on the chain NOW. A file
   /// describing a chain that has since been reset is precisely the stale
@@ -505,6 +690,10 @@ export async function gatherLifetimeFacts(deps: {
     keystoreAgents: await deps.keystore.agentCount(),
     contractsDeployed: code !== undefined && code !== '0x',
     acknowledged: deps.acknowledged,
+    // FINDING 22: the two halves of the watermark comparison, gathered here
+    // with everything else so the control stays a pure function of facts.
+    reservations: deps.store.reservationsEverMade(),
+    watermark: await deps.keystore.ledgerWatermark(),
   };
 }
 
@@ -548,8 +737,100 @@ export class LedgerWipeError extends Error {
 /// loud-but-continuing failure is precisely what routed someone to
 /// the wipe, and a warning at startup is read by nobody. The legitimate reset
 /// is not obstructed - it IS the acknowledgement flag, one documented step.
-export function assertLedgerLifetimeIntact(facts: LifetimeFacts): void {
+/// A STORE THAT WENT BACKWARDS IN TIME while the keys beside it did not.
+///
+/// This is the restore case, and it is invisible to every fact above: a backup
+/// restored onto a live game has wallets, has keys, has contracts, and has a
+/// non-empty intents table. Nothing in the wipe control fires, and the store
+/// quietly re-offers intent ids that have already paid.
+///
+/// The comparison is between volumes, because that is the only place the
+/// disagreement can exist. Restore both from one backup and they AGREE - which
+/// is correct, that is a consistent restore and it starts. Wipe both and they
+/// are both zero, which is the existing full-reset path. Restore the store
+/// alone, under the keystore it was taken from, and the store's counter is
+/// behind a mark the keystore still remembers.
+///
+/// Checked BEFORE the wipe control below rather than after: a restored store is
+/// a more specific diagnosis than an empty one, and an operator who is told the
+/// wrong one goes looking in the wrong place.
+export function assertLedgerNotRestored(facts: LifetimeFacts): void {
   if (facts.acknowledged) return;
+
+  // THE KEYSTORE VANISHED UNDER A LIVE LEDGER - the same asymmetry as the wipe
+  // control, from the other side. A store that has reserved intents beside a
+  // keystore that has never recorded a mark means the keys were replaced while
+  // the ledger stayed, and every wallet this store remembers is now a wallet
+  // nobody holds a key for.
+  //
+  // A GENUINELY FRESH DEPLOYMENT HAS BOTH AT ZERO, which is why this is the one
+  // conjunct: `reservations > 0` is what separates a new keystore from a lost
+  // one, and the first boot after this ships has a counter of 0 whatever the
+  // store's age, so nobody is accused on a history that was never recorded.
+  if (facts.watermark === null) {
+    if (facts.reservations === 0) return;
+    throw new LedgerWipeError(
+      `refusing to start: this store has reserved ${facts.reservations} intent(s), and the ` +
+        `keystore beside it has no record of ever having seen this ledger. The KEYSTORE is the ` +
+        `volume that changed: a fresh one under a live store, or a keystore volume that did not ` +
+        `mount.\n` +
+        `\n` +
+        `Every wallet this store remembers is a wallet nobody now holds a key for - they cannot ` +
+        `sign, and their balances are unreachable. ${LEDGER_RESET_NOTICE}.\n` +
+        `\n` +
+        `${FREEZE_RECOVERY_ADVICE}.\n` +
+        `\n` +
+        `Find the keystore volume that belongs with this store. If you meant to end this game, ` +
+        `say so explicitly and start again with --acknowledge-ledger-reset (or ` +
+        `CHAIN_SVC_ACKNOWLEDGE_LEDGER_RESET=1).`,
+    );
+  }
+
+  if (facts.reservations >= facts.watermark) return;
+
+  throw new LedgerWipeError(
+    `refusing to start: this store has reserved ${facts.reservations} intent(s) in its whole ` +
+      `history, and the keystore beside it remembers a store that had reached ${facts.watermark}. ` +
+      `A counter that only ever goes up cannot fall, so this store is OLDER than the keys it is ` +
+      `being used with - a backup restored under a live game, or a store volume from a different ` +
+      `deployment.\n` +
+      `\n` +
+      `The wallets in that keystore still exist and still hold their balances, and ` +
+      `${LEDGER_RESET_NOTICE}. Every intent id consumed between this store's backup and now is ` +
+      `reservable again, and an id that has already paid can pay a second time.\n` +
+      `\n` +
+      `${FREEZE_RECOVERY_ADVICE}.\n` +
+      `\n` +
+      `If this is the store you meant to restore, the keystore beside it is the wrong one - find ` +
+      `the keystore from the same backup. If you meant to end this game, say so explicitly and ` +
+      `start again with --acknowledge-ledger-reset (or CHAIN_SVC_ACKNOWLEDGE_LEDGER_RESET=1).`,
+  );
+}
+
+export function assertLedgerLifetimeIntact(facts: LifetimeFacts): void {
+  if (facts.acknowledged) {
+    // FINDING 21: THE ACKNOWLEDGEMENT IS NOT A DISMISSAL, and it warns EVERY
+    // boot rather than the one it was typed for.
+    //
+    // It returned silently, so the flag's cost was paid once and then forgotten
+    // - and the flag lives in compose or in an env file, where it stays set for
+    // every restart afterwards. A facilitator who acknowledged a wipe in
+    // October is running an unguarded store in March with nothing to remind
+    // them, which is the same shape as the refusal this whole function replaced
+    // being routed around.
+    //
+    // It names the notice and the advice rather than summarising them, so the
+    // operator reads the same sentences the refusal would have shown - one
+    // place for what a wipe costs, which is why LEDGER_RESET_NOTICE is a
+    // constant at all.
+    console.warn(
+      `[chain-svc] LEDGER RESET ACKNOWLEDGED: this store starts without the idempotency and ` +
+        `retirement history a wipe removed. ${LEDGER_RESET_NOTICE}. ${FREEZE_RECOVERY_ADVICE}. ` +
+        `This warning repeats every boot for as long as the acknowledgement is set; clearing ` +
+        `it once the game is healthy is what makes the next wipe loud again.`,
+    );
+    return;
+  }
   if (!facts.intentsEmpty) return;
   // THE STORE IS STILL HERE. A store that survived the restart remembers the
   // wallets it spawned; a wiped one remembers nothing, because the file is

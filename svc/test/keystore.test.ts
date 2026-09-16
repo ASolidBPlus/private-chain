@@ -119,3 +119,87 @@ describe('keystore', () => {
     await expect(ks.load('orch:vendor')).rejects.toThrow(HttpError);
   }, 20_000);
 });
+
+// THE KDF PARAMETERS ARE THIS BUILD'S, NOT THE FILE'S.
+//
+// N, r and p set the COST of the derivation. Taking them from the key file lets
+// the FILE choose how hard it is to brute-force itself - and a writer of the
+// keystore volume is precisely the threat this encryption exists for, since a
+// reader of the volume is exactly who must not get the keys. Rewrite N to 2,
+// re-encrypt under that, and the service opens it without complaint: the work
+// factor stops being a property of the service and becomes a property of the
+// artefact under suspicion.
+describe('the key file does not get to choose its own work factor', () => {
+  async function tamper(dir: string, agentId: string, patch: (kdf: Record<string, unknown>) => void) {
+    const path = join(dir, `${encodeURIComponent(agentId)}.json`);
+    const file = JSON.parse(readFileSync(path, 'utf8')) as { kdf: Record<string, unknown> };
+    patch(file.kdf);
+    writeFileSync(path, JSON.stringify(file));
+  }
+
+  // Each parameter on its own, so a check that guards only the famous one fails
+  // here rather than passing on the row somebody thought of.
+  for (const [param, weakened] of [['N', 2], ['r', 1], ['p', 2]] as Array<[string, number]>) {
+    it(`refuses a file whose ${param} differs, naming it`, async () => {
+      const dir = freshDir();
+      const ks = new Keystore(dir, 'secret');
+      await ks.create('orch:tamper');
+      await tamper(dir, 'orch:tamper', (kdf) => { kdf[param] = weakened; });
+
+      let err: unknown;
+      try { await ks.load('orch:tamper'); } catch (e) { err = e; }
+      expect(err).toBeInstanceOf(HttpError);
+      // NAMED, because the alternative failure - deriving with our constants
+      // against a file written under others - reports "could not be decrypted",
+      // and an operator then goes looking for a corrupt file or a wrong
+      // passphrase rather than for the parameter that changed.
+      expect((err as HttpError).detail).toContain(`${param}=${weakened}`);
+      expect((err as HttpError).detail).toMatch(/KDF parameters/);
+    }, 20_000);
+  }
+
+  // THE CONTROL: an untouched file still loads. Without it the rows above pass
+  // on a keystore that refuses everything, which is a different and much worse
+  // service.
+  it('control: an untampered file still round-trips', async () => {
+    const dir = freshDir();
+    const ks = new Keystore(dir, 'secret');
+    const created = await ks.create('orch:intact');
+    expect((await ks.load('orch:intact')).privateKey).toBe(created.privateKey);
+  }, 20_000);
+});
+
+// FINDING 22's keystore half: the watermark beside the keys.
+describe('the ledger watermark', () => {
+  it('is absent until something records one, and absent is not zero', async () => {
+    const ks = new Keystore(freshDir(), 'secret');
+    // NULL, not 0. A keystore that has never spoken cannot accuse a store of
+    // anything; one that has spoken and said zero is a different fact, and the
+    // control reads them differently.
+    expect(await ks.ledgerWatermark()).toBeNull();
+  });
+
+  it('records a mark and never lowers it', async () => {
+    const ks = new Keystore(freshDir(), 'secret');
+    await ks.recordLedgerWatermark(40);
+    expect(await ks.ledgerWatermark()).toBe(40);
+    await ks.recordLedgerWatermark(12);
+    // THE POINT OF THE WHOLE MECHANISM. If a restored store could write its own
+    // lower count over the mark, the next boot would compare against the value
+    // the restore itself installed and start cleanly.
+    expect(await ks.ledgerWatermark()).toBe(40);
+    await ks.recordLedgerWatermark(57);
+    expect(await ks.ledgerWatermark()).toBe(57);
+  });
+
+  it('reads a corrupt mark as absent rather than throwing', async () => {
+    const dir = freshDir();
+    const ks = new Keystore(dir, 'secret');
+    await ks.recordLedgerWatermark(40);
+    writeFileSync(join(dir, '.ledger-watermark'), 'not a number');
+    // This file is the ACCUSER, not the evidence: a corrupt byte in it must not
+    // be able to lock an operator out of a healthy game. The keys beside it are
+    // what the control is really about.
+    expect(await ks.ledgerWatermark()).toBeNull();
+  });
+});

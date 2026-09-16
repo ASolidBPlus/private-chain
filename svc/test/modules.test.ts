@@ -343,6 +343,43 @@ describe('asChainError', () => {
     expect(asChainError(new Error('fetch failed')).code).toBe('chain_unreachable');
     expect(asChainError(new Error('execution reverted')).code).toBe('chain_error');
   });
+
+  // FINDING 11: the detail is a FIXED STRING per code, and the raw line goes to
+  // the log - the split `asCallError` already makes for a revert.
+  //
+  // The reviewer's two shapes. viem's first line carries whatever the node
+  // said: RPC urls, internal addresses, encoded calldata. Both codes are
+  // persona-facing and their detail crosses with them, so that text reached a
+  // model through a refusal - and a persona can do nothing with it either way,
+  // since the remedy for both is "tell an operator".
+  it('says the same thing whatever the node said', () => {
+    const transport = new Error(
+      'fetch failed\nURL: http://chain-internal.hub.local:8545\nRequest body: {"method":"eth_call"}',
+    );
+    const revert = new Error(
+      'execution reverted\nRaw Call Arguments:\n  to: 0x5FbDB2315678afecb367f032d93F642f64180aa3\n  data: 0xa9059cbb',
+    );
+    expect(asChainError(transport).detail).toBe('node unreachable');
+    expect(asChainError(revert).detail).toBe('chain call failed');
+  });
+
+  // THE CONTROL: the raw text is not merely absent from the body, it is PRESENT
+  // in the log. Asserting the fixed string alone would pass on a build that
+  // threw the diagnostic away entirely, which is safe and useless - the point
+  // is that the operator still has it.
+  it('control: the raw line reaches the log and not the body', () => {
+    const lines: string[] = [];
+    const warn = console.warn;
+    console.warn = (...a: unknown[]) => { lines.push(a.join(' ')); };
+    try {
+      const err = asChainError(new Error('execution reverted\n  to: 0xdeadbeef secret-rpc.internal'));
+      expect(err.detail).not.toContain('0xdeadbeef');
+      expect(err.detail).not.toContain('secret-rpc.internal');
+      expect(lines.join('\n')).toContain('0xdeadbeef');
+    } finally {
+      console.warn = warn;
+    }
+  });
 });
 
 // §4.4 / §8.8. WHAT A DENY LIST MEANS ON A DEPLOYMENT WITH NO REGISTRY.

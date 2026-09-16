@@ -111,7 +111,7 @@ describe('call counting', () => {
       stageCap: null, token: 'play',
       call: CALL,
     });
-    expect(store.intentCall('i-1')).toEqual({
+    expect(store.intentCall('orch:a', 'i-1')).toEqual({
       contract: 'converter',
       function: 'convert',
       argsHash: 'h1',
@@ -122,7 +122,7 @@ describe('call counting', () => {
   it('leaves the call columns null for a transfer intent', () => {
     const store = new Store(':memory:');
     store.reserve({ intentId: 'i-1', agentId: 'orch:a', stage: 's1', amount: 1n, stageCap: null, token: 'play' });
-    expect(store.intentCall('i-1')).toBeNull();
+    expect(store.intentCall('orch:a', 'i-1')).toBeNull();
     store.close();
   });
 
@@ -157,7 +157,7 @@ describe('call counting', () => {
       store.reserve({ token: 'play', intentId: 'i-3', agentId: 'orch:a', stage: 's1', amount: 0n, stageCap: null, call: CALL })
         .outcome,
     ).toBe('over_stage_cap');
-    expect(store.intentCall('i-3')).toBeNull();
+    expect(store.intentCall('orch:a', 'i-3')).toBeNull();
     expect(store.callCount('orch:a', 's1', 'converter', 'convert')).toBe(2);
     store.close();
   });
@@ -211,7 +211,7 @@ describe('call counting', () => {
     store.reserve({ token: 'play', intentId: 'i-1', agentId: 'orch:a', stage: 's1', amount: 0n, stageCap: null, call: CALL });
     expect(store.callCount('orch:a', 's1', 'converter', 'convert')).toBe(1);
 
-    store.release('i-1');
+    store.release('orch:a', 'i-1');
     expect(store.callCount('orch:a', 's1', 'converter', 'convert')).toBe(0);
     store.close();
   });
@@ -225,7 +225,7 @@ describe('call counting', () => {
     expect(call('i-2')).toBe('reserved');
     expect(call('i-3')).toBe('over_stage_cap');
 
-    store.release('i-2');
+    store.release('orch:a', 'i-2');
     expect(call('i-4')).toBe('reserved');
     store.close();
   });
@@ -237,9 +237,9 @@ describe('call counting', () => {
     // call has a hash too - it was mined - so it keeps its slot.
     const store = new Store(':memory:');
     store.reserve({ token: 'play', intentId: 'i-1', agentId: 'orch:a', stage: 's1', amount: 0n, stageCap: null, call: CALL });
-    store.completeIntent('i-1', '0xdead');
+    store.completeIntent('orch:a', 'i-1', '0xdead');
 
-    store.release('i-1');
+    store.release('orch:a', 'i-1');
     expect(store.callCount('orch:a', 's1', 'converter', 'convert')).toBe(1);
     store.close();
   });
@@ -260,7 +260,7 @@ describe('call counting', () => {
     expect(store.spentThisStage('orch:a', 's1', 'play')).toBe(10n);
     expect(store.callCount('orch:a', 's1', 'converter', 'convert')).toBe(1);
 
-    store.release('i-1');
+    store.release('orch:a', 'i-1');
     expect(store.spentThisStage('orch:a', 's1', 'play')).toBe(0n);
     expect(store.callCount('orch:a', 's1', 'converter', 'convert')).toBe(0);
     store.close();
@@ -273,7 +273,7 @@ describe('call counting', () => {
     const store = new Store(':memory:');
     const { maxPerStage: _none, ...noLimit } = CALL;
     store.reserve({ token: 'play', intentId: 'i-1', agentId: 'orch:a', stage: 's1', amount: 0n, stageCap: null, call: noLimit });
-    store.release('i-1');
+    store.release('orch:a', 'i-1');
     expect(store.callCount('orch:a', 's1', 'converter', 'convert')).toBe(0);
     store.close();
   });
@@ -344,7 +344,7 @@ describe('stage spend, per token', () => {
     store.reserve({ intentId: 'i-play', agentId: 'orch:a', stage, amount: 100n, stageCap: { cap: 1000n }, token: 'play' });
     store.reserve({ intentId: 'i-gold', agentId: 'orch:a', stage, amount: 7n, stageCap: { cap: 1000n }, token: 'gold' });
 
-    store.release('i-gold');
+    store.release('orch:a', 'i-gold');
     expect(store.spentThisStage('orch:a', stage, 'gold')).toBe(0n);
     expect(store.spentThisStage('orch:a', stage, 'play')).toBe(100n);
     store.close();
@@ -353,7 +353,7 @@ describe('stage spend, per token', () => {
   it('records the token on the intent itself', () => {
     const store = new Store(':memory:');
     store.reserve({ intentId: 'i-gold', agentId: 'orch:a', stage, amount: 7n, stageCap: null, token: 'gold' });
-    expect(store.intentToken('i-gold')).toBe('gold');
+    expect(store.intentToken('orch:a', 'i-gold')).toBe('gold');
     store.close();
   });
 });

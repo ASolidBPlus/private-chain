@@ -529,6 +529,32 @@ describe('a deployment with custom contract entries', () => {
     }
   });
 
+  // FINDING 5: a key that spells one of this store's COLUMN names is refused at
+  // load, naming the column.
+  //
+  // Not a corruption by itself - the key is written as a VALUE - but a trap for
+  // the next migration: the v6 -> v7 step's `SELECT agent_id, stage, <key>,
+  // spent` reads as "select the key" and becomes "select the column" the moment
+  // somebody interpolates instead of binding, which is what that step did until
+  // this release. Load is the last point an operator can change it: past here
+  // the key is in `stage_spend.token` and `intents.token`, and renaming a token
+  // after wallets have spent in it is a migration nobody wants to write.
+  it('refuses a token key that is a column name in the schema', () => {
+    for (const key of ['token', 'stage', 'amount', 'spent', 'topic', 'emissions']) {
+      write([{ kind: 'token', key, contract: 'Token', address: SHOP, symbol: 'X', decimals: 18 }]);
+      expect(() => loadDeployment(dir)).toThrow(/is a column name in this store's schema/);
+    }
+  });
+
+  // THE CONTROL. Every row above would pass on a loader that refused every key,
+  // so an ordinary key must still load - and `play`, the key every fixture in
+  // this repo uses, is the one that proves the list is a list rather than a
+  // rejection.
+  it('control: an ordinary key still loads', () => {
+    write([TOKEN_ENTRY, { kind: 'contract', key: 'shop', contract: 'Converter', address: SHOP }]);
+    expect(() => loadDeployment(dir)).not.toThrow();
+  });
+
   // ONE NAMESPACE. Increment 2 checked token keys against token keys, which was
   // complete while tokens were the only kind carrying one. A caller of the
   // generic op passes a key and gets back one contract, so two entries under

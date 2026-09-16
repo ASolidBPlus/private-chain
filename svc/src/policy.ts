@@ -197,8 +197,54 @@ function isUsableCaps(value: unknown): value is TokenCaps {
   );
 }
 
+/// EVERY KEY A POLICY DOCUMENT MAY CARRY, per level (finding: unknown keys).
+///
+/// v0.8.0 closed mistyped VALUES - a cap that is present and unusable refuses -
+/// and left KEYS free-form, which is the one fail-open direction it did not
+/// shut: `caps: { play: { max_per_tx_typo: '5' } }` reads as an entry with NO
+/// bounds, unbounded for that token, in both layers, consistently. The typo
+/// WIDENS, silently, and the file still looks right to whoever wrote it.
+///
+/// FIELD LEVELS ARE CLOSED; MAP LEVELS ARE NOT. `caps` is keyed by TOKEN, and
+/// a deployment's token keys are its own - enumerating them here would refuse
+/// every real document. The distinction is the rule: a level whose keys are a
+/// fixed vocabulary is checked, a level whose keys are data is indexed.
+///
+/// `agentId` IS KNOWN, not tolerated-and-ignored: `writePolicyFile` stamps it
+/// on every file this service writes, so a rule without it would mark the
+/// entire installed base unreadable and re-create the write-path defect through
+/// a second door. `frozen` IS tolerated: every file written before v0.8.0
+/// carries `frozen: false`, and refusing those would do the same.
+const POLICY_KEYS = new Set(['agentId', 'caps', 'allow', 'deny', 'max_per_tx', 'max_per_stage']);
+/// Written by a version that had a service-side freeze. Read and DISCARDED -
+/// `normalisePolicy` never carries it forward - but its presence is not an
+/// error, because the alternative is bricking every wallet spawned before
+/// v0.8.0.
+const POLICY_KEYS_TOLERATED = new Set(['frozen']);
+/// One token's bounds. A closed field level: these are the only two bounds
+/// there are, and a third spelling of either is the defect this rule exists for.
+const TOKEN_CAPS_KEYS = new Set(['max_per_tx', 'max_per_stage']);
+
+/// Are all of this object's keys ones the level knows?
+function keysKnown(value: Record<string, unknown>, known: Set<string>, tolerated?: Set<string>): boolean {
+  return Object.keys(value).every((k) => known.has(k) || tolerated?.has(k) === true);
+}
+
+/// The unknown keys of an object, for a message that can name them.
+export function unknownKeysOf(
+  value: Record<string, unknown>,
+  known: Set<string>,
+  tolerated?: Set<string>,
+): string[] {
+  return Object.keys(value).filter((k) => !known.has(k) && tolerated?.has(k) !== true);
+}
+
 function isTokenCaps(value: unknown): value is TokenCaps {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  // SHAPE ONLY, still: a VALUE that is present and unusable is field-level
+  // garbage and refuses at the point of use, for that token alone. A KEY the
+  // entry has never had is a wrong shape, and shape failures are file-level.
+  return keysKnown(value as Record<string, unknown>, TOKEN_CAPS_KEYS);
 }
 
 /// Turns the defaults file's `caps` into one entry per DEPLOYED token.
@@ -425,6 +471,40 @@ export function loadPolicyDefaults(
     if (typeof entry !== 'object' || entry === null || !isNameList(entry.allow) || !isNameList(entry.deny)) {
       throw new Error(`chain-svc: policy defaults at ${path} have no valid "${kind}" entry`);
     }
+    // A KIND'S ENTRY IS A CLOSED FIELD LEVEL, refused AT LOAD with the key
+    // named - unlike a per-wallet file, which has no operator standing beside
+    // it and gets the fixed unreadable marker instead.
+    //
+    // `agentId` is tolerated here for symmetry with the per-wallet document:
+    // one rule fewer to remember, and it means nothing at this level anyway.
+    //
+    // THE TOP LEVEL OF THIS FILE IS NOT CHECKED, and that is deliberate. It is
+    // a MAP keyed by kind, and the loop above INDEXES INTO IT by WALLET_KINDS
+    // rather than enumerating it - which is why `_comment` has always worked,
+    // the file's documented stand-in for JSON's missing comment syntax and
+    // something the shipped example leans on. Enumerating it to check for
+    // unknown keys would refuse that, and refuse a kind added by a newer build.
+    const unknown = unknownKeysOf(entry, POLICY_KEYS, POLICY_KEYS_TOLERATED);
+    if (unknown.length > 0) {
+      throw new Error(
+        `chain-svc: policy defaults at ${path}, entry "${kind}": unknown ` +
+          `${unknown.length === 1 ? 'key' : 'keys'} ${unknown.map((k) => `"${k}"`).join(', ')}. ` +
+          `A misspelled bound is read as absent, which since v0.8.0 means NO bound.`,
+      );
+    }
+    if (entry.caps !== undefined && typeof entry.caps === 'object' && entry.caps !== null) {
+      for (const [token, capsEntry] of Object.entries(entry.caps as Record<string, unknown>)) {
+        if (typeof capsEntry !== 'object' || capsEntry === null || Array.isArray(capsEntry)) continue;
+        const bad = unknownKeysOf(capsEntry as Record<string, unknown>, TOKEN_CAPS_KEYS);
+        if (bad.length > 0) {
+          throw new Error(
+            `chain-svc: policy defaults at ${path}, entry "${kind}", token "${token}": unknown ` +
+              `${bad.length === 1 ? 'key' : 'keys'} ${bad.map((k) => `"${k}"`).join(', ')}. ` +
+              `A misspelled bound is read as absent, which since v0.8.0 means NO bound.`,
+          );
+        }
+      }
+    }
     out[kind] = {
       caps: expandCaps(entry.caps, tokenKeys, kind, path),
       allow: fillPatterns(entry.allow, tld, 'allow', warn),
@@ -608,6 +688,7 @@ export function mergePolicy(
 export function isPolicy(value: unknown): value is AgentPolicy {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
   const p = value as Record<string, unknown>;
+  if (!keysKnown(p, POLICY_KEYS, POLICY_KEYS_TOLERATED)) return false;
   if (p.allow !== undefined && !isNameList(p.allow)) return false;
   if (p.deny !== undefined && !isNameList(p.deny)) return false;
   // EITHER SHAPE IS A VALID DOCUMENT ON DISK. A store full of v0.4.0 policy

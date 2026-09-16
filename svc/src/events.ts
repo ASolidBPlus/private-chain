@@ -465,7 +465,11 @@ export class EventTail {
         intent.firstFrom.toLowerCase() === wallet.toLowerCase();
 
       if (landed) {
-        this.store.completeIntent(intent.intentId, intent.firstTx!);
+        // BOTH COORDINATES, and `unresolvedIntents` already selects the agent
+        // id - it is passed to `recordEmission` two lines from here. Keyed on
+        // the id alone this UPDATE would stamp one wallet's tx hash onto
+        // another wallet's open reservation.
+        this.store.completeIntent(intent.agentId, intent.intentId, intent.firstTx!);
         confirmed++;
         continue;
       }
